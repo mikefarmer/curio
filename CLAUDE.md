@@ -54,6 +54,7 @@ invoke('read_file', { path })     // Read file contents
 invoke('get_filename', { path })  // Extract filename from path
 invoke('create_window', { filePath })  // Open new window
 invoke('get_cli_files')           // Get files passed via CLI
+invoke('write_log', { message })  // Write debug log to ~/.curio_debug.log
 ```
 
 ### Tauri Plugins Used
@@ -75,3 +76,58 @@ CSS variables are defined in `src/styles/variables.css`:
 - Light/dark mode via `prefers-color-scheme`
 - System fonts: SF Pro Display, SF Pro Text, SF Mono
 - Content max-width: 720px
+
+## File Watching in Production
+
+Curio uses a dual-layer file watching strategy for live reload:
+
+1. **Native watcher** (`watchImmediate`) - Instant detection of file changes
+2. **Polling fallback** (5s interval) - Catches events the watcher may miss
+
+### Critical Production Requirements
+
+**The `fs:allow-stat` permission in `src-tauri/capabilities/default.json` is REQUIRED for production builds.**
+
+Without this permission, file watching fails silently because:
+- The native watcher uses `stat()` to track file modification times
+- The polling fallback also depends on `stat()` for change detection
+- In dev mode, Tauri auto-grants permissions (it works)
+- In production DMG builds, only explicitly declared permissions work
+
+### Event Coalescing
+
+File system events are coalesced over 100ms to prevent redundant reloads:
+- Multiple rapid edits trigger only one reload
+- Delete followed by create is treated as a modification
+- Scroll position is preserved across reloads
+
+### User Feedback
+
+- **Status indicator** (bottom-right corner) shows watcher health:
+  - Green dot = actively watching
+  - Red dot = auto-reload failed (click to manually reload)
+- **Manual reload** available via Cmd+R keyboard shortcut
+- **Notifications** appear when auto-reload is unavailable
+
+### Troubleshooting File Watching
+
+If file watching fails in production builds:
+
+1. **Check console logs** - DevTools can be enabled via `tauri.conf.json` → `app.security.devtools: true`
+2. **Check file logs** - Debug logs written to `~/.curio_debug.log`
+3. **Look for permission errors** - Specifically stat() or watch() permission denied
+4. **Verify status indicator** - Should show green dot when working
+5. **Test manual reload** - Press Cmd+R to verify file reading works
+6. **Check polling** - Should see events logged every 5 seconds
+
+### Debug Logging
+
+All file watcher operations are logged with `[FileWatcher]` prefix:
+- Initialization logs include platform, file path, permissions test
+- Event processing shows raw events and coalesced actions
+- Polling shows mtime changes and detected modifications
+- Errors include full stack traces
+
+Logs appear in both:
+- Browser DevTools console (if DevTools enabled)
+- File at `~/.curio_debug.log` (always available)

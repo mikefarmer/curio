@@ -45,7 +45,7 @@ const {
 } = useSearch()
 
 // File watcher composable
-const { isWatching, startWatching, stopWatching } = useFileWatcher()
+const { isWatching, watcherError, startWatching, stopWatching, getWatcherStatus } = useFileWatcher()
 
 // State
 const filename = ref('')
@@ -54,6 +54,9 @@ const isLoading = ref(false)
 const error = ref('')
 const hasContent = ref(false)
 const contentRef = ref(null)
+const rawContent = ref('')  // Track last loaded content for deduplication
+const statusMessage = ref('')  // Notification message for user
+const showStatus = ref(false)  // Show status notification
 
 // Link content element to search
 watch(contentRef, (el) => {
@@ -120,33 +123,68 @@ async function openFile() {
 
 // Handle file changes from watcher
 async function handleFileChange(event) {
-  // Handle different event types based on the fs plugin's event structure
-  const eventType = event.type?.modify ? 'modified' :
-                    event.type?.create ? 'created' :
-                    event.type?.remove ? 'deleted' : null
+  // Event type is now a simple string from our coalesced watcher
+  const eventType = event.type
 
-  if (eventType === 'modified' || eventType === 'created') {
-    try {
-      // Save scroll position
-      const scrollPos = contentRef.value?.scrollTop ?? 0
-
-      // Reload content
-      const content = await invoke('read_file', { path: filePath.value })
-      setContent(content)
-
-      // Restore scroll position after render
-      await nextTick()
-      if (contentRef.value) {
-        contentRef.value.scrollTop = scrollPos
-      }
-    } catch (e) {
-      console.error('Failed to reload file:', e)
-    }
-  } else if (eventType === 'deleted') {
+  if (eventType === 'deleted') {
     error.value = 'The file has been deleted or moved.'
     hasContent.value = false
     await stopWatching()
+    return
   }
+
+  // Handle modified (includes 'created' from delete+recreate)
+  try {
+    // Capture relative scroll position (0-1 ratio)
+    const container = contentRef.value
+    const scrollRatio = container && container.scrollHeight > container.clientHeight
+      ? container.scrollTop / (container.scrollHeight - container.clientHeight)
+      : 0
+
+    // Reload content
+    const content = await invoke('read_file', { path: filePath.value })
+
+    // Skip re-render if content unchanged (handles "touch" events)
+    if (content === rawContent.value) {
+      console.log('[App] Content unchanged, skipping re-render')
+      return
+    }
+
+    rawContent.value = content
+    setContent(content)
+
+    // Restore relative scroll position after render
+    await nextTick()
+    if (container && container.scrollHeight > container.clientHeight) {
+      container.scrollTop = scrollRatio * (container.scrollHeight - container.clientHeight)
+    }
+  } catch (e) {
+    console.error('Failed to reload file:', e)
+  }
+}
+
+// Manual reload - useful when auto-reload fails
+async function reloadCurrentFile() {
+  if (!filePath.value) return
+
+  try {
+    const content = await invoke('read_file', { path: filePath.value })
+    rawContent.value = content
+    setContent(content)
+    showStatusNotification('File reloaded manually')
+  } catch (e) {
+    error.value = `Failed to reload file: ${e}`
+    console.error(e)
+  }
+}
+
+// Show temporary status notification
+function showStatusNotification(message) {
+  statusMessage.value = message
+  showStatus.value = true
+  setTimeout(() => {
+    showStatus.value = false
+  }, 3000)
 }
 
 // Load file content
@@ -164,6 +202,7 @@ async function loadFile(path) {
     hasContent.value = true
     isLoading.value = false
     await nextTick()  // Wait for article to render
+    rawContent.value = content  // Track for deduplication
     setContent(content)
 
     // Update window title
@@ -172,6 +211,11 @@ async function loadFile(path) {
 
     // Start watching the file for changes
     await startWatching(path, handleFileChange)
+
+    // Check if watcher failed and notify user
+    if (watcherError.value) {
+      showStatusNotification('Auto-reload unavailable. Press ⌘R to refresh manually.')
+    }
   } catch (e) {
     error.value = `Failed to read file: ${e}`
     console.error(e)
@@ -224,6 +268,12 @@ function handleKeydown(e) {
   if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
     e.preventDefault()
     openSearch()
+  }
+
+  // Cmd+R - Manual reload
+  if ((e.metaKey || e.ctrlKey) && e.key === 'r') {
+    e.preventDefault()
+    reloadCurrentFile()
   }
 
   // Escape - Close search (handled in SearchBar too)
@@ -283,6 +333,25 @@ onUnmounted(() => {
       @next="nextMatch"
       @prev="prevMatch"
     />
+
+    <!-- Status notification -->
+    <div v-if="showStatus" class="status-notification">
+      {{ statusMessage }}
+    </div>
+
+    <!-- Watcher status indicator -->
+    <div
+      v-if="hasContent"
+      class="watcher-status"
+      :class="{
+        'status-watching': isWatching && !watcherError,
+        'status-error': watcherError
+      }"
+      :title="watcherError ? 'Auto-reload failed. Press ⌘R to reload manually.' : 'Auto-reload active'"
+      @click="watcherError ? reloadCurrentFile() : null"
+    >
+      <div class="status-dot"></div>
+    </div>
 
     <!-- Main content area -->
     <main class="content">
@@ -450,6 +519,101 @@ kbd {
   .search-highlight-active {
     background: rgba(255, 149, 0, 0.5);
     box-shadow: 0 0 0 2px rgba(255, 149, 0, 0.25);
+  }
+}
+
+/* Status notification */
+.status-notification {
+  position: fixed;
+  bottom: 60px;
+  right: 20px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  font-size: 14px;
+  z-index: 1000;
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* Watcher status indicator */
+.watcher-status {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  z-index: 999;
+  transition: all 0.2s ease;
+}
+
+.watcher-status:hover {
+  transform: scale(1.1);
+}
+
+.watcher-status.status-error {
+  cursor: pointer;
+  border-color: #ff3b30;
+}
+
+.watcher-status.status-error:hover {
+  background: rgba(255, 59, 48, 0.1);
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #8e8e93;
+  transition: background 0.2s ease;
+}
+
+.watcher-status.status-watching .status-dot {
+  background: #34c759;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.watcher-status.status-error .status-dot {
+  background: #ff3b30;
+  animation: none;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-notification {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  }
+
+  .watcher-status {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
   }
 }
 </style>

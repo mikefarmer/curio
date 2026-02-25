@@ -209,16 +209,18 @@ code[class*="language-"] {
 
 .mermaid-container {
   margin: 1.25em 0;
-  padding: 20px;
+  padding: 20px 40px;
   background: var(--bg-secondary);
   border-radius: 10px;
   overflow-x: auto;
+  width: 100vw;
+  margin-left: calc(-50vw + 50%);
+  box-sizing: border-box;
 }
 
 .mermaid-container svg {
   display: block;
   margin: 0 auto;
-  max-width: 100%;
   height: auto;
 }
 

@@ -21,6 +21,28 @@ fn get_cli_files(state: tauri::State<CliFiles>) -> Vec<String> {
     result
 }
 
+/// Write a log message to file for debugging production builds
+#[tauri::command]
+fn write_log(message: String) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let log_path = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".curio_debug.log");
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| e.to_string())?;
+
+    writeln!(file, "[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), message)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Create a new window, optionally with a file path to load
 #[tauri::command]
 async fn create_window(app: tauri::AppHandle, file_path: Option<String>) -> Result<String, String> {
@@ -93,7 +115,8 @@ pub fn run() {
             read_file,
             get_filename,
             create_window,
-            get_cli_files
+            get_cli_files,
+            write_log
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
