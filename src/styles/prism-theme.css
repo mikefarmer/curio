@@ -208,6 +208,7 @@ code[class*="language-"] {
    ============================================ */
 
 .mermaid-container {
+  position: relative;
   margin: 1.25em 0;
   padding: 20px 40px;
   background: var(--bg-secondary);

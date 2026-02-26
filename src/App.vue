@@ -7,6 +7,7 @@ import mermaid from 'mermaid'
 import { useMarkdown } from './composables/useMarkdown'
 import { useSearch } from './composables/useSearch'
 import { useFileWatcher } from './composables/useFileWatcher'
+import { useSectionCopy } from './composables/useSectionCopy'
 import SearchBar from './components/SearchBar.vue'
 
 // Initialize Mermaid with theme detection
@@ -47,6 +48,9 @@ const {
 // File watcher composable
 const { isWatching, watcherError, startWatching, stopWatching, getWatcherStatus } = useFileWatcher()
 
+// Section copy composable
+const { injectCopyButtons } = useSectionCopy()
+
 // State
 const filename = ref('')
 const filePath = ref('')
@@ -65,10 +69,11 @@ watch(contentRef, (el) => {
 
 // Clear search highlights when content changes
 // Use flush: 'post' to ensure DOM is updated before rendering Mermaid
-watch(renderedHtml, () => {
+watch(renderedHtml, async () => {
   clearHighlights()
   if (renderedHtml.value) {
-    renderMermaidDiagrams()
+    await renderMermaidDiagrams()
+    injectCopyButtons(contentRef.value, rawContent.value)
   }
 }, { flush: 'post' })
 
@@ -86,6 +91,8 @@ async function renderMermaidDiagrams() {
     if (!code) continue
 
     try {
+      // Preserve mermaid source before replacing with SVG
+      container.dataset.mermaidSource = code
       const id = `mermaid-${Math.random().toString(36).substr(2, 9)}`
       const { svg } = await mermaid.render(id, code)
       container.innerHTML = svg
@@ -614,6 +621,110 @@ kbd {
 
   .watcher-status {
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  }
+}
+
+/* ============================================
+   Copy Buttons
+   ============================================ */
+
+.copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+  z-index: 10;
+}
+
+.copy-btn:hover {
+  background: var(--border);
+  color: var(--text-primary);
+}
+
+.copy-btn:active {
+  transform: scale(0.95);
+}
+
+.copy-btn-copied {
+  color: #34c759;
+}
+
+.copy-btn-copied:hover {
+  color: #34c759;
+}
+
+/* Per-element copy buttons */
+.copy-item {
+  position: relative;
+}
+
+.copy-item:hover > .copy-item-btn {
+  opacity: 1;
+}
+
+.copy-item-btn {
+  top: 0;
+  right: -44px;
+}
+
+/* Code block copy buttons */
+.code-block-wrapper {
+  position: relative;
+}
+
+.code-block-wrapper > pre[class*="language-"] {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.code-block-wrapper {
+  margin: 1.25em 0;
+}
+
+.code-block-wrapper:hover > .copy-code-btn {
+  opacity: 1;
+}
+
+.copy-code-btn {
+  top: 8px;
+  right: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.copy-code-btn:hover {
+  background: rgba(0, 0, 0, 0.5);
+  color: rgba(255, 255, 255, 0.9);
+}
+
+/* Mermaid copy buttons */
+.mermaid-container:hover > .copy-mermaid-btn {
+  opacity: 1;
+}
+
+.copy-mermaid-btn {
+  top: 8px;
+  right: 8px;
+}
+
+/* Adjust button position for narrow viewports */
+@media (max-width: 900px) {
+  .copy-item-btn {
+    right: 0;
+    top: -4px;
   }
 }
 </style>

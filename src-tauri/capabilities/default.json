@@ -16,6 +16,7 @@
     "fs:allow-watch",
     "fs:allow-unwatch",
     "fs:allow-stat",
+    "clipboard-manager:allow-write-text",
     {
       "identifier": "fs:scope",
       "allow": [
