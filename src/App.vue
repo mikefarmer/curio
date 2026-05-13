@@ -10,6 +10,7 @@ import { useSearch } from './composables/useSearch'
 import { useFileWatcher } from './composables/useFileWatcher'
 import { useSectionCopy } from './composables/useSectionCopy'
 import { useAnnotations, stripAnnotations } from './composables/useAnnotations'
+import { useUndoStack } from './composables/useUndoStack'
 import SearchBar from './components/SearchBar.vue'
 import SelectionToolbar from './components/SelectionToolbar.vue'
 import CommentInput from './components/CommentInput.vue'
@@ -110,6 +111,18 @@ const pendingIntent = ref(null)     // 'comment' | 'suggest' | 'code-comment'
 const pendingCodeBlock = ref(null)  // { hash, text } when commenting on code
 const authorPromptOpen = ref(false)
 const reanchoringId = ref(null)     // orphan id currently in re-anchor mode
+
+// Edit-mode toggle (spec §6, §22 v4):
+//   'suggest' — edits create <!--curio:e--> annotations (default).
+//   'direct'  — raw markdown textarea, writes go straight to the file.
+const editMode = ref('suggest')
+const directBuffer = ref('')       // textarea content while in direct mode
+const directTextareaRef = ref(null)
+let directWriteTimer = null         // debounce handle for direct-mode disk writes
+
+// Annotation-level undo stack (v4). Direct-mode char edits use the
+// textarea's native browser undo — see useUndoStack.js for rationale.
+const { undoStack, redoStack, push: pushUndo, popUndo, popRedo, clear: clearUndo } = useUndoStack()
 
 // Link content element to search
 watch(contentRef, (el) => {
@@ -303,6 +316,9 @@ async function loadFile(path) {
     rawContent.value = content  // Track for deduplication
     setContent(content)
 
+    // New file → fresh undo history. Stack is session-scoped per spec.
+    clearUndo()
+
     // Update window title
     const currentWindow = getCurrentWindow()
     await currentWindow.setTitle(filename.value)
@@ -392,6 +408,26 @@ function handleKeydown(e) {
     panelOpen.value = !panelOpen.value
   }
 
+  // Cmd+Shift+D - Toggle Direct edit mode
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'd' || e.key === 'D')) {
+    e.preventDefault()
+    setEditMode(editMode.value === 'direct' ? 'suggest' : 'direct')
+  }
+
+  // Cmd+Z / Cmd+Shift+Z — annotation-level undo/redo. Only fires when
+  // focus is NOT in a textarea/input/contenteditable (those get their
+  // native browser undo). Spec §17 / §22 v4.
+  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
+    if (isEditableFocused()) return
+    e.preventDefault()
+    doUndo()
+  }
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
+    if (isEditableFocused()) return
+    e.preventDefault()
+    doRedo()
+  }
+
   // Escape - Close search (handled in SearchBar too) or cancel re-anchor mode
   if (e.key === 'Escape') {
     if (reanchoringId.value) {
@@ -465,6 +501,7 @@ async function completeReanchor(selection) {
   const id = reanchoringId.value
   if (!id) return
   try {
+    const before = rawContent.value
     const newContent = reanchorOrphanInState({
       content: rawContent.value,
       id,
@@ -472,6 +509,7 @@ async function completeReanchor(selection) {
       contextBefore: selection.contextBefore,
       contextAfter: selection.contextAfter
     })
+    pushUndo(before, 're-anchor')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
     rawContent.value = newContent
@@ -587,6 +625,7 @@ async function onCommentSubmit(body) {
       return
     }
 
+    pushUndo(rawContent.value, pendingIntent.value === 'code-comment' ? 'code comment' : 'comment')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
     rawContent.value = newContent
@@ -625,6 +664,7 @@ async function onSuggestSubmit(newText) {
       contextAfter: pendingSelection.value.contextAfter,
       newText
     })
+    pushUndo(rawContent.value, 'suggest edit')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
     rawContent.value = newContent
@@ -648,7 +688,8 @@ function onSuggestCancel() {
   pendingIntent.value = null
 }
 
-async function applyContentChange(newContent) {
+async function applyContentChange(newContent, undoLabel = null) {
+  if (undoLabel !== null) pushUndo(rawContent.value, undoLabel)
   markSelfWrite()
   await invoke('write_md_atomic', { path: filePath.value, content: newContent })
   rawContent.value = newContent
@@ -661,7 +702,7 @@ async function onAcceptEdit(id) {
   if (!filePath.value) return
   try {
     const newContent = acceptEditInState(rawContent.value, id)
-    await applyContentChange(newContent)
+    await applyContentChange(newContent, 'accept edit')
   } catch (e) {
     console.error('[Annotate] accept edit failed:', e)
     showStatusNotification(`Could not accept edit: ${e.message || e}`)
@@ -672,7 +713,7 @@ async function onRejectEdit(id) {
   if (!filePath.value) return
   try {
     const newContent = rejectEditInState(rawContent.value, id)
-    await applyContentChange(newContent)
+    await applyContentChange(newContent, 'reject edit')
   } catch (e) {
     console.error('[Annotate] reject edit failed:', e)
     showStatusNotification(`Could not reject edit: ${e.message || e}`)
@@ -683,7 +724,7 @@ async function onAcceptAllEdits() {
   if (!filePath.value) return
   try {
     const newContent = acceptAllEditsInState(rawContent.value)
-    await applyContentChange(newContent)
+    await applyContentChange(newContent, 'accept all edits')
   } catch (e) {
     console.error('[Annotate] accept-all failed:', e)
   }
@@ -693,7 +734,7 @@ async function onRejectAllEdits() {
   if (!filePath.value) return
   try {
     const newContent = rejectAllEditsInState(rawContent.value)
-    await applyContentChange(newContent)
+    await applyContentChange(newContent, 'reject all edits')
   } catch (e) {
     console.error('[Annotate] reject-all failed:', e)
   }
@@ -703,6 +744,7 @@ async function onDeleteAnnotation(id) {
   if (!filePath.value) return
   try {
     const newContent = deleteAnnotation(rawContent.value, id)
+    pushUndo(rawContent.value, 'delete annotation')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
     rawContent.value = newContent
@@ -765,6 +807,7 @@ async function onAcceptSuggestion(id) {
       idx: suggestion.idx,
       anchorText: suggestion.anchorText || orphan.anchor_text
     })
+    pushUndo(rawContent.value, 're-anchor (suggestion)')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
     rawContent.value = newContent
@@ -828,6 +871,7 @@ async function onStripAll() {
   try {
     // mode='original' keeps original text for edits (so they revert, not apply)
     const stripped = stripAnnotations(rawContent.value, 'original')
+    pushUndo(rawContent.value, 'strip all')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: stripped })
     rawContent.value = stripped
@@ -838,6 +882,108 @@ async function onStripAll() {
   } catch (e) {
     console.error('[Annotate] strip all failed:', e)
     showStatusNotification(`Could not strip: ${e.message || e}`)
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Direct edit mode (v4, spec §6/§22)
+// ────────────────────────────────────────────────────────────────────────────
+// Raw markdown textarea. Native textarea undo handles char-level history;
+// we don't push to our annotation undo stack on direct keystrokes — see
+// useUndoStack.js for the rationale. Writes are debounced 500ms so each
+// burst of typing produces a single atomic disk write + watcher-suppress.
+
+function setEditMode(mode) {
+  if (mode === editMode.value) return
+  if (mode === 'direct') {
+    directBuffer.value = rawContent.value
+    editMode.value = 'direct'
+    nextTick(() => directTextareaRef.value?.focus())
+  } else {
+    // Leaving direct mode: flush any pending write synchronously so the
+    // file and rawContent agree before the rendered view comes back.
+    flushDirectWrite({ immediate: true })
+    editMode.value = 'suggest'
+  }
+}
+
+function onDirectInput(e) {
+  directBuffer.value = e.target.value
+  if (directWriteTimer) clearTimeout(directWriteTimer)
+  directWriteTimer = setTimeout(() => flushDirectWrite(), 500)
+}
+
+async function flushDirectWrite({ immediate = false } = {}) {
+  if (directWriteTimer) {
+    clearTimeout(directWriteTimer)
+    directWriteTimer = null
+  }
+  if (!filePath.value) return
+  if (directBuffer.value === rawContent.value) return
+
+  const newContent = directBuffer.value
+  try {
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+    rawContent.value = newContent
+    // Skip re-rendering HTML while user is actively typing — costly and
+    // they're not looking at it. Sync renderedHtml only on mode switch
+    // (immediate=true) so the suggest-mode view is fresh on return.
+    if (immediate) setContent(newContent)
+    refreshAnnotations(newContent)
+    await persistSidecar()
+  } catch (e) {
+    console.error('[Annotate] direct write failed:', e)
+    showStatusNotification(`Could not save: ${e.message || e}`)
+  }
+}
+
+// If the file changes externally while we're in direct mode, reload the
+// textarea buffer so the user sees the new content. Any unsaved <500ms
+// typing burst is lost — acceptable per the existing in-flight policy.
+watch(rawContent, (newVal) => {
+  if (editMode.value === 'direct' && newVal !== directBuffer.value) {
+    // Avoid clobbering an in-flight debounced write by checking pending state
+    if (!directWriteTimer) directBuffer.value = newVal
+  }
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// Undo / redo (v4, spec §17/§22)
+// ────────────────────────────────────────────────────────────────────────────
+
+function isEditableFocused() {
+  const el = document.activeElement
+  if (!el) return false
+  const tag = el.tagName
+  return tag === 'TEXTAREA' || tag === 'INPUT' || el.isContentEditable
+}
+
+async function doUndo() {
+  const entry = popUndo(rawContent.value)
+  if (!entry) return
+  await applyUndoSnapshot(entry.before, `undo: ${entry.label}`)
+}
+
+async function doRedo() {
+  const entry = popRedo(rawContent.value)
+  if (!entry) return
+  await applyUndoSnapshot(entry.before, `redo: ${entry.label}`)
+}
+
+async function applyUndoSnapshot(content, label) {
+  try {
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content })
+    rawContent.value = content
+    setContent(content)
+    refreshAnnotations(content)
+    await persistSidecar()
+    if (editMode.value === 'direct') directBuffer.value = content
+    showStatusNotification(label)
+  } catch (e) {
+    console.error('[Annotate]', label, 'failed:', e)
+    showStatusNotification(`Could not ${label}: ${e.message || e}`)
   }
 }
 
@@ -889,6 +1035,7 @@ async function onContentClick(e) {
   target.checked = !currentChecked
 
   try {
+    pushUndo(rawContent.value, 'toggle checkbox')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
     rawContent.value = newContent
@@ -948,18 +1095,34 @@ onUnmounted(() => {
         <button
           :class="{ active: viewMode === 'annotated' }"
           @click="viewMode = 'annotated'"
+          :disabled="editMode === 'direct'"
           title="Show annotations and comments"
         >Annotated</button>
         <button
           :class="{ active: viewMode === 'original' }"
           @click="viewMode = 'original'"
+          :disabled="editMode === 'direct'"
           title="Show the document as if no annotations existed"
         >Original</button>
         <button
           :class="{ active: viewMode === 'final' }"
           @click="viewMode = 'final'"
+          :disabled="editMode === 'direct'"
           title="Preview the document with all suggested edits applied"
         >Final</button>
+      </div>
+      <!-- Edit-mode toggle (spec §12.4): Suggest vs Direct -->
+      <div class="edit-mode-toggle" role="group" aria-label="Edit mode">
+        <button
+          :class="{ active: editMode === 'suggest' }"
+          @click="setEditMode('suggest')"
+          title="Selections create annotations (default)"
+        >Suggest</button>
+        <button
+          :class="{ active: editMode === 'direct' }"
+          @click="setEditMode('direct')"
+          title="Edit the raw markdown directly (⌘⇧D)"
+        >Direct</button>
       </div>
       <button
         class="panel-toggle"
@@ -1001,6 +1164,17 @@ onUnmounted(() => {
           <button @click="openFile" class="open-button">Try Again</button>
         </div>
 
+        <!-- Direct edit mode: raw markdown textarea (spec §6, v4) -->
+        <textarea
+          v-else-if="editMode === 'direct'"
+          ref="directTextareaRef"
+          class="direct-editor"
+          :value="directBuffer"
+          @input="onDirectInput"
+          spellcheck="false"
+          aria-label="Raw markdown editor"
+        ></textarea>
+
         <!-- Rendered markdown content -->
         <article
           v-else
@@ -1033,9 +1207,9 @@ onUnmounted(() => {
       />
     </div>
 
-    <!-- Floating selection toolbar -->
+    <!-- Floating selection toolbar (hidden in Direct mode) -->
     <SelectionToolbar
-      v-if="hasContent && viewMode === 'annotated'"
+      v-if="hasContent && editMode === 'suggest' && viewMode === 'annotated'"
       ref="selectionToolbarRef"
       :target="contentRef"
       @comment="onSelectionComment"
@@ -1139,6 +1313,66 @@ onUnmounted(() => {
   background: var(--bg-primary);
   color: var(--text-primary);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.view-mode-toggle button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Edit-mode toggle (Suggest / Direct) — same shape as view-mode toggle */
+.edit-mode-toggle {
+  display: flex;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.edit-mode-toggle button {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.edit-mode-toggle button.active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* Direct mode editor — full-height monospace textarea */
+.direct-editor {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 16px 20px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.6;
+  resize: none;
+  outline: none;
+  box-sizing: border-box;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 2;
+}
+
+.direct-editor:focus {
+  border-color: var(--accent, #007aff);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
 }
 
 .panel-toggle {
