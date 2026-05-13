@@ -1,6 +1,7 @@
 import { ref, computed } from 'vue'
 import MarkdownIt from 'markdown-it'
 import Prism from 'prismjs'
+import { stripAnnotations, hashCode } from './useAnnotations'
 
 // Import Prism language components (order matters for dependencies!)
 // Core languages first
@@ -78,30 +79,39 @@ const md = new MarkdownIt({
   breaks: false,
 })
 
-// Custom fence renderer for code blocks with Prism
+// Custom fence renderer for code blocks with Prism. Wraps in a div with a
+// content hash so the annotation UI can attach comments to specific blocks.
 md.renderer.rules.fence = function(tokens, idx) {
   const token = tokens[idx]
   const code = token.content
   const lang = resolveLanguage(token.info)
 
-  // Mermaid blocks - special handling
+  // Mermaid blocks - special handling (not commentable in v2)
   if (lang === 'mermaid') {
     return `<div class="mermaid-container"><pre class="mermaid">${escapeHtml(code)}</pre></div>\n`
   }
 
-  // Try to highlight with Prism
+  // Code content is what gets hashed. Strip the trailing newline that
+  // markdown-it always appends to fence content so the hash matches the
+  // source-side fence body (which doesn't include the closing fence line).
+  const codeForHash = code.replace(/\n$/, '')
+  const hash = hashCode(codeForHash)
+
+  let inner
   if (lang && Prism.languages[lang]) {
     try {
       const highlighted = Prism.highlight(code, Prism.languages[lang], lang)
-      return `<pre class="language-${lang}"><code class="language-${lang}">${highlighted}</code></pre>\n`
+      inner = `<pre class="language-${lang}"><code class="language-${lang}">${highlighted}</code></pre>`
     } catch (e) {
       console.error('Prism highlighting error:', e)
     }
   }
+  if (!inner) {
+    const langClass = lang ? `language-${lang}` : 'language-none'
+    inner = `<pre class="${langClass}"><code class="${langClass}">${escapeHtml(code)}</code></pre>`
+  }
 
-  // Fallback: no highlighting
-  const langClass = lang ? `language-${lang}` : 'language-none'
-  return `<pre class="${langClass}"><code class="${langClass}">${escapeHtml(code)}</code></pre>\n`
+  return `<div class="code-block-wrapper" data-code-hash="${hash}">${inner}</div>\n`
 }
 
 // Strikethrough support: ~~text~~
@@ -213,28 +223,66 @@ md.renderer.rules.link_open = function(tokens, idx, options, env, self) {
 }
 
 /**
- * Post-process HTML to convert task list items
+ * Post-process HTML to convert task list items.
+ * Checkboxes are NOT disabled — App.vue delegates clicks for toggling.
+ * data-task-index lets the click handler map back to source order.
+ * A single regex pass handles both [ ] and [x] so indices match source order.
  */
 function processTaskLists(html) {
-  // Match list items that start with [ ] or [x]
-  return html.replace(
-    /<li>(\s*)\[ \]/g,
-    '<li class="task-list-item"><input type="checkbox" class="task-checkbox" disabled> '
-  ).replace(
-    /<li>(\s*)\[x\]/gi,
-    '<li class="task-list-item"><input type="checkbox" class="task-checkbox" disabled checked> '
-  )
+  let i = 0
+  return html.replace(/<li>(\s*)\[( |x|X)\]/g, (_, _ws, state) => {
+    const idx = i++
+    const checked = state.toLowerCase() === 'x' ? ' checked' : ''
+    return `<li class="task-list-item"><input type="checkbox" class="task-checkbox" data-task-index="${idx}"${checked}> `
+  })
 }
 
 /**
- * Composable for markdown parsing with Prism highlighting
+ * Transform curio range markers into HTML spans before markdown parsing.
+ * Comments: <!--curio:c=ID-->TEXT<!--/curio:c-->
+ *           -> <span class="curio-anchor" data-curio-id="ID">TEXT</span>
+ * Edits:    <!--curio:e=ID-->~~old~~ → **new**<!--/curio:e-->
+ *           -> <span class="curio-edit" data-curio-id="ID">~~old~~ → **new**</span>
+ *
+ * For edits we keep the inner markdown intact (markdown-it processes the
+ * strikethrough and bold as usual); the wrapper span is HTML so the inner
+ * markdown still renders.
+ *
+ * NOTE: markdown-it treats raw HTML spans inline only when html:true (we have
+ * that). Inline markdown inside the span is parsed normally.
+ */
+function transformAnnotationMarkers(content) {
+  return content
+    .replace(
+      /<!--curio:c=([0-9a-f]{8})-->([\s\S]*?)<!--\/curio:c-->/g,
+      (_, id, inner) => `<span class="curio-anchor" data-curio-id="${id}">${inner}</span>`
+    )
+    .replace(
+      /<!--curio:e=([0-9a-f]{8})-->([\s\S]*?)<!--\/curio:e-->/g,
+      (_, id, inner) => `<span class="curio-edit" data-curio-id="${id}">${inner}</span>`
+    )
+}
+
+/**
+ * Composable for markdown parsing with Prism highlighting.
+ * viewMode:
+ *   'annotated' (default) — curio markers as styled spans + comment blockquotes
+ *   'original'            — strip curio markers; for edits keep the original text
+ *   'final'               — strip curio markers; for edits apply the new text
  */
 export function useMarkdown() {
   const rawContent = ref('')
+  const viewMode = ref('annotated')
+
+  function prepareSource(source) {
+    if (viewMode.value === 'original') return stripAnnotations(source, 'original')
+    if (viewMode.value === 'final') return stripAnnotations(source, 'final')
+    return transformAnnotationMarkers(source)
+  }
 
   const renderedHtml = computed(() => {
     if (!rawContent.value) return ''
-    const html = md.render(rawContent.value)
+    const html = md.render(prepareSource(rawContent.value))
     return processTaskLists(html)
   })
 
@@ -243,13 +291,14 @@ export function useMarkdown() {
   }
 
   function render(content) {
-    const html = md.render(content)
+    const html = md.render(prepareSource(content))
     return processTaskLists(html)
   }
 
   return {
     rawContent,
     renderedHtml,
+    viewMode,
     setContent,
     render
   }

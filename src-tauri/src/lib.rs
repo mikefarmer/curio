@@ -1,6 +1,11 @@
 mod files;
+mod annotations;
 
 use files::{read_file, get_filename};
+use annotations::{
+    read_sidecar, write_sidecar, delete_sidecar, list_sidecars,
+    write_md_atomic, write_file_new, read_curio_config, write_curio_config,
+};
 use tauri::{RunEvent, WebviewUrl, WebviewWindowBuilder};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -106,6 +111,9 @@ pub fn run() {
         })
         .collect();
 
+    // Run sidecar GC on startup (best effort; never blocks startup on errors)
+    annotations::run_gc();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -117,7 +125,15 @@ pub fn run() {
             get_filename,
             create_window,
             get_cli_files,
-            write_log
+            write_log,
+            read_sidecar,
+            write_sidecar,
+            delete_sidecar,
+            list_sidecars,
+            write_md_atomic,
+            write_file_new,
+            read_curio_config,
+            write_curio_config
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

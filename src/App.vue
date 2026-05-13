@@ -1,14 +1,22 @@
 <script setup>
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { save } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, ask } from '@tauri-apps/plugin-dialog'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import mermaid from 'mermaid'
 import { useMarkdown } from './composables/useMarkdown'
 import { useSearch } from './composables/useSearch'
 import { useFileWatcher } from './composables/useFileWatcher'
 import { useSectionCopy } from './composables/useSectionCopy'
+import { useAnnotations, stripAnnotations } from './composables/useAnnotations'
 import SearchBar from './components/SearchBar.vue'
+import SelectionToolbar from './components/SelectionToolbar.vue'
+import CommentInput from './components/CommentInput.vue'
+import SuggestEditInput from './components/SuggestEditInput.vue'
+import AnnotationPanel from './components/AnnotationPanel.vue'
+import AuthorPrompt from './components/AuthorPrompt.vue'
+import ViewMenu from './components/ViewMenu.vue'
 
 // Initialize Mermaid with theme detection
 function initMermaid() {
@@ -30,11 +38,12 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
 })
 
 // Markdown composable
-const { renderedHtml, setContent } = useMarkdown()
+const { renderedHtml, setContent, viewMode } = useMarkdown()
 
 // Search composable
 const {
   searchQuery,
+  searchScope,
   isSearchOpen,
   matchDisplay,
   contentElement,
@@ -46,10 +55,35 @@ const {
 } = useSearch()
 
 // File watcher composable
-const { isWatching, watcherError, startWatching, stopWatching, getWatcherStatus } = useFileWatcher()
+const { isWatching, watcherError, startWatching, stopWatching, getWatcherStatus, markSelfWrite } = useFileWatcher()
 
 // Section copy composable
 const { injectCopyButtons } = useSectionCopy()
+
+// Annotations composable
+const {
+  annotations,
+  orphans,
+  author,
+  hasAuthor,
+  loadForFile: loadAnnotationsForFile,
+  refreshAnnotations,
+  persistSidecar,
+  createComment: createCommentInState,
+  createCodeComment: createCodeCommentInState,
+  createEdit: createEditInState,
+  acceptEdit: acceptEditInState,
+  rejectEdit: rejectEditInState,
+  acceptAllEdits: acceptAllEditsInState,
+  rejectAllEdits: rejectAllEditsInState,
+  deleteAnnotation,
+  dismissOrphan,
+  suggestOrphanLocation,
+  reanchorOrphan: reanchorOrphanInState,
+  reanchorOrphanAtIdx: reanchorOrphanAtIdxInState,
+  initAuthor,
+  setAuthor
+} = useAnnotations()
 
 // State
 const filename = ref('')
@@ -61,6 +95,21 @@ const contentRef = ref(null)
 const rawContent = ref('')  // Track last loaded content for deduplication
 const statusMessage = ref('')  // Notification message for user
 const showStatus = ref(false)  // Show status notification
+
+// Annotation UI state
+const panelOpen = ref(true)
+const selectionToolbarRef = ref(null)
+const commentInputOpen = ref(false)
+const commentInputAnchorX = ref(0)
+const commentInputAnchorY = ref(0)
+const suggestInputOpen = ref(false)
+const suggestInputAnchorX = ref(0)
+const suggestInputAnchorY = ref(0)
+const pendingSelection = ref(null)  // { text, contextBefore, contextAfter }
+const pendingIntent = ref(null)     // 'comment' | 'suggest' | 'code-comment'
+const pendingCodeBlock = ref(null)  // { hash, text } when commenting on code
+const authorPromptOpen = ref(false)
+const reanchoringId = ref(null)     // orphan id currently in re-anchor mode
 
 // Link content element to search
 watch(contentRef, (el) => {
@@ -74,8 +123,36 @@ watch(renderedHtml, async () => {
   if (renderedHtml.value) {
     await renderMermaidDiagrams()
     injectCopyButtons(contentRef.value, rawContent.value)
+    injectCodeCommentButtons(contentRef.value)
   }
 }, { flush: 'post' })
+
+// Inject a "💬" comment button into each code-block wrapper (alongside the
+// existing copy button). Clicking it triggers a comment-on-code-block flow.
+function injectCodeCommentButtons(articleEl) {
+  if (!articleEl) return
+  const wrappers = articleEl.querySelectorAll('.code-block-wrapper[data-code-hash]')
+  for (const wrapper of wrappers) {
+    if (wrapper.querySelector('.curio-code-comment-btn')) continue
+    const btn = document.createElement('button')
+    btn.className = 'copy-btn curio-code-comment-btn'
+    btn.type = 'button'
+    btn.innerHTML = '💬'
+    btn.title = 'Comment on this code block'
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      e.preventDefault()
+      const codeEl = wrapper.querySelector('code') || wrapper.querySelector('pre')
+      const codeText = codeEl ? codeEl.textContent : ''
+      onCodeBlockCommentRequested({
+        hash: wrapper.dataset.codeHash,
+        text: codeText,
+        rect: btn.getBoundingClientRect()
+      })
+    })
+    wrapper.appendChild(btn)
+  }
+}
 
 // Render Mermaid diagrams after content updates
 async function renderMermaidDiagrams() {
@@ -159,6 +236,9 @@ async function handleFileChange(event) {
 
     rawContent.value = content
     setContent(content)
+    // Re-derive annotations and orphans against the new content
+    refreshAnnotations(content)
+    await persistSidecar()
 
     // Restore relative scroll position after render
     await nextTick()
@@ -202,7 +282,18 @@ async function loadFile(path) {
     filePath.value = path
 
     filename.value = await invoke('get_filename', { path })
-    const content = await invoke('read_file', { path })
+    let content = await invoke('read_file', { path })
+
+    // Load annotations: this may inject a curio-sidecar header if missing.
+    // We do NOT write the file just to add the header — only when an actual
+    // annotation is created. Until then the in-memory `content` carries the
+    // header but disk is untouched.
+    try {
+      const result = await loadAnnotationsForFile(content, path)
+      content = result.contentOut
+    } catch (e) {
+      console.error('[Annotate] loadForFile failed:', e)
+    }
 
     // Set state so article element is visible BEFORE setting content
     // This ensures the watcher can find .mermaid-container elements
@@ -283,9 +374,31 @@ function handleKeydown(e) {
     reloadCurrentFile()
   }
 
-  // Escape - Close search (handled in SearchBar too)
-  if (e.key === 'Escape' && isSearchOpen.value) {
-    closeSearch()
+  // Cmd+Shift+M - Comment on current selection
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'm' || e.key === 'M')) {
+    e.preventDefault()
+    selectionToolbarRef.value?.triggerCommentFromCurrentSelection()
+  }
+
+  // Cmd+Shift+E - Suggest edit on current selection
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'e' || e.key === 'E')) {
+    e.preventDefault()
+    selectionToolbarRef.value?.triggerSuggestFromCurrentSelection()
+  }
+
+  // Cmd+Shift+A - Toggle annotations panel
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'a' || e.key === 'A')) {
+    e.preventDefault()
+    panelOpen.value = !panelOpen.value
+  }
+
+  // Escape - Close search (handled in SearchBar too) or cancel re-anchor mode
+  if (e.key === 'Escape') {
+    if (reanchoringId.value) {
+      onCancelReanchor()
+      return
+    }
+    if (isSearchOpen.value) closeSearch()
   }
 }
 
@@ -321,8 +434,472 @@ async function checkStartupFile() {
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
+  // Load saved author name; if none, we'll prompt on first comment.
+  initAuthor()
   checkStartupFile()
 })
+
+// ────────────────────────────────────────────────────────────────────────────
+// Annotation handlers
+// ────────────────────────────────────────────────────────────────────────────
+
+function onSelectionComment(selection) {
+  // If we're in re-anchor mode, the next "comment" gesture re-attaches the orphan
+  if (reanchoringId.value) {
+    completeReanchor(selection)
+    return
+  }
+  startIntent('comment', selection)
+}
+
+function onSelectionSuggest(selection) {
+  // Re-anchor mode also accepts the suggest gesture (treat both as "use this selection")
+  if (reanchoringId.value) {
+    completeReanchor(selection)
+    return
+  }
+  startIntent('suggest', selection)
+}
+
+async function completeReanchor(selection) {
+  const id = reanchoringId.value
+  if (!id) return
+  try {
+    const newContent = reanchorOrphanInState({
+      content: rawContent.value,
+      id,
+      anchorText: selection.text,
+      contextBefore: selection.contextBefore,
+      contextAfter: selection.contextAfter
+    })
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+    rawContent.value = newContent
+    setContent(newContent)
+    refreshAnnotations(newContent)
+    await persistSidecar()
+    showStatusNotification('Comment re-anchored.')
+  } catch (e) {
+    console.error('[Annotate] re-anchor failed:', e)
+    showStatusNotification(`Could not re-anchor: ${e.message || e}`)
+  } finally {
+    reanchoringId.value = null
+    window.getSelection()?.removeAllRanges()
+  }
+}
+
+function onCodeBlockCommentRequested({ hash, text, rect }) {
+  pendingSelection.value = null
+  pendingCodeBlock.value = { hash, text }
+  pendingIntent.value = 'code-comment'
+
+  if (!hasAuthor.value) {
+    authorPromptOpen.value = true
+    return
+  }
+  openCodeCommentInput(rect)
+}
+
+function openCodeCommentInput(rect) {
+  if (rect) {
+    commentInputAnchorX.value = rect.left + rect.width / 2
+    commentInputAnchorY.value = rect.bottom
+  }
+  commentInputOpen.value = true
+}
+
+function startIntent(intent, selection) {
+  pendingSelection.value = selection
+  pendingIntent.value = intent
+
+  if (!hasAuthor.value) {
+    authorPromptOpen.value = true
+    return
+  }
+  openIntentInput()
+}
+
+function openIntentInput() {
+  if (pendingIntent.value === 'code-comment') {
+    openCodeCommentInput(null)
+    return
+  }
+  // Anchor near the current selection rect
+  const sel = window.getSelection()
+  let x = 0, y = 0
+  if (sel && sel.rangeCount > 0) {
+    const rect = sel.getRangeAt(0).getBoundingClientRect()
+    x = rect.left + rect.width / 2
+    y = rect.bottom
+  }
+  if (pendingIntent.value === 'suggest') {
+    suggestInputAnchorX.value = x
+    suggestInputAnchorY.value = y
+    suggestInputOpen.value = true
+  } else {
+    commentInputAnchorX.value = x
+    commentInputAnchorY.value = y
+    commentInputOpen.value = true
+  }
+}
+
+async function onAuthorSubmit(name) {
+  await setAuthor(name)
+  authorPromptOpen.value = false
+  if (pendingIntent.value) {
+    openIntentInput()
+  }
+}
+
+function onAuthorCancel() {
+  authorPromptOpen.value = false
+  pendingIntent.value = null
+  pendingSelection.value = null
+  pendingCodeBlock.value = null
+}
+
+async function onCommentSubmit(body) {
+  if (!filePath.value) {
+    commentInputOpen.value = false
+    return
+  }
+  try {
+    let newContent
+    if (pendingIntent.value === 'code-comment' && pendingCodeBlock.value) {
+      const result = createCodeCommentInState({
+        content: rawContent.value,
+        codeHash: pendingCodeBlock.value.hash,
+        codeText: pendingCodeBlock.value.text,
+        body
+      })
+      newContent = result.content
+    } else if (pendingSelection.value) {
+      const result = createCommentInState({
+        content: rawContent.value,
+        anchorText: pendingSelection.value.text,
+        contextBefore: pendingSelection.value.contextBefore,
+        contextAfter: pendingSelection.value.contextAfter,
+        body
+      })
+      newContent = result.content
+    } else {
+      commentInputOpen.value = false
+      return
+    }
+
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+    rawContent.value = newContent
+    setContent(newContent)
+    refreshAnnotations(newContent)
+    await persistSidecar()
+  } catch (e) {
+    console.error('[Annotate] create comment failed:', e)
+    showStatusNotification(`Could not add comment: ${e.message || e}`)
+  } finally {
+    commentInputOpen.value = false
+    pendingSelection.value = null
+    pendingCodeBlock.value = null
+    pendingIntent.value = null
+    window.getSelection()?.removeAllRanges()
+  }
+}
+
+function onCommentCancel() {
+  commentInputOpen.value = false
+  pendingSelection.value = null
+  pendingCodeBlock.value = null
+  pendingIntent.value = null
+}
+
+async function onSuggestSubmit(newText) {
+  if (!pendingSelection.value || !filePath.value) {
+    suggestInputOpen.value = false
+    return
+  }
+  try {
+    const { content: newContent } = createEditInState({
+      content: rawContent.value,
+      anchorText: pendingSelection.value.text,
+      contextBefore: pendingSelection.value.contextBefore,
+      contextAfter: pendingSelection.value.contextAfter,
+      newText
+    })
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+    rawContent.value = newContent
+    setContent(newContent)
+    refreshAnnotations(newContent)
+    await persistSidecar()
+  } catch (e) {
+    console.error('[Annotate] create edit failed:', e)
+    showStatusNotification(`Could not add edit: ${e.message || e}`)
+  } finally {
+    suggestInputOpen.value = false
+    pendingSelection.value = null
+    pendingIntent.value = null
+    window.getSelection()?.removeAllRanges()
+  }
+}
+
+function onSuggestCancel() {
+  suggestInputOpen.value = false
+  pendingSelection.value = null
+  pendingIntent.value = null
+}
+
+async function applyContentChange(newContent) {
+  markSelfWrite()
+  await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+  rawContent.value = newContent
+  setContent(newContent)
+  refreshAnnotations(newContent)
+  await persistSidecar()
+}
+
+async function onAcceptEdit(id) {
+  if (!filePath.value) return
+  try {
+    const newContent = acceptEditInState(rawContent.value, id)
+    await applyContentChange(newContent)
+  } catch (e) {
+    console.error('[Annotate] accept edit failed:', e)
+    showStatusNotification(`Could not accept edit: ${e.message || e}`)
+  }
+}
+
+async function onRejectEdit(id) {
+  if (!filePath.value) return
+  try {
+    const newContent = rejectEditInState(rawContent.value, id)
+    await applyContentChange(newContent)
+  } catch (e) {
+    console.error('[Annotate] reject edit failed:', e)
+    showStatusNotification(`Could not reject edit: ${e.message || e}`)
+  }
+}
+
+async function onAcceptAllEdits() {
+  if (!filePath.value) return
+  try {
+    const newContent = acceptAllEditsInState(rawContent.value)
+    await applyContentChange(newContent)
+  } catch (e) {
+    console.error('[Annotate] accept-all failed:', e)
+  }
+}
+
+async function onRejectAllEdits() {
+  if (!filePath.value) return
+  try {
+    const newContent = rejectAllEditsInState(rawContent.value)
+    await applyContentChange(newContent)
+  } catch (e) {
+    console.error('[Annotate] reject-all failed:', e)
+  }
+}
+
+async function onDeleteAnnotation(id) {
+  if (!filePath.value) return
+  try {
+    const newContent = deleteAnnotation(rawContent.value, id)
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+    rawContent.value = newContent
+    setContent(newContent)
+    refreshAnnotations(newContent)
+    await persistSidecar()
+  } catch (e) {
+    console.error('[Annotate] delete failed:', e)
+  }
+}
+
+function onJumpTo(id) {
+  // First try inline-anchor types
+  let el = document.querySelector(
+    `.curio-anchor[data-curio-id="${id}"], .curio-edit[data-curio-id="${id}"]`
+  )
+  // Code-comment: jump to the code block by hash
+  if (!el) {
+    const ann = annotations.value.find(a => a.id === id)
+    const hash = ann && (ann.codeHash || ann.code_hash)
+    if (hash) {
+      el = document.querySelector(`.code-block-wrapper[data-code-hash="${hash}"]`)
+    }
+  }
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.classList.add('curio-anchor-flash')
+    setTimeout(() => el.classList.remove('curio-anchor-flash'), 1200)
+  }
+}
+
+async function onDismissOrphan(id) {
+  dismissOrphan(id)
+  await persistSidecar()
+}
+
+// Fuzzy suggestions for each orphan, recomputed when content or orphans change
+const orphanSuggestions = computed(() => {
+  const result = {}
+  if (!rawContent.value) return result
+  for (const o of orphans.value) {
+    try {
+      result[o.id] = suggestOrphanLocation(rawContent.value, o.id)
+    } catch (e) {
+      result[o.id] = { idx: null, candidates: 0 }
+    }
+  }
+  return result
+})
+
+async function onAcceptSuggestion(id) {
+  const suggestion = orphanSuggestions.value[id]
+  if (!suggestion || suggestion.idx === null) return
+  const orphan = orphans.value.find(o => o.id === id)
+  if (!orphan) return
+  try {
+    const newContent = reanchorOrphanAtIdxInState({
+      content: rawContent.value,
+      id,
+      idx: suggestion.idx,
+      anchorText: suggestion.anchorText || orphan.anchor_text
+    })
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+    rawContent.value = newContent
+    setContent(newContent)
+    refreshAnnotations(newContent)
+    await persistSidecar()
+  } catch (e) {
+    console.error('[Annotate] accept-suggestion failed:', e)
+    showStatusNotification(`Could not re-anchor: ${e.message || e}`)
+  }
+}
+
+function onStartReanchor(id) {
+  reanchoringId.value = id
+  showStatusNotification('Select text in the document to re-anchor this comment.')
+}
+
+function onCancelReanchor() {
+  reanchoringId.value = null
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Overflow menu: Export Final / Strip All
+// ────────────────────────────────────────────────────────────────────────────
+
+async function onExportFinal() {
+  if (!filePath.value) return
+  // Suggest a default filename: original.md → original.final.md
+  const defaultPath = filePath.value.replace(/(\.[^./\\]+)?$/, '.final$1')
+  let target
+  try {
+    target = await save({
+      defaultPath,
+      filters: [{ name: 'Markdown', extensions: ['md', 'markdown', 'mdown', 'mkd', 'mkdown'] }]
+    })
+  } catch (e) {
+    console.error('[Annotate] save dialog failed:', e)
+    return
+  }
+  if (!target) return  // user cancelled
+
+  try {
+    const finalContent = stripAnnotations(rawContent.value, 'final')
+    // Different file — no need to suppress watcher
+    await invoke('write_file_new', { path: target, content: finalContent })
+    showStatusNotification('Exported Final view to ' + target.split('/').pop())
+  } catch (e) {
+    console.error('[Annotate] export final failed:', e)
+    showStatusNotification(`Could not export: ${e.message || e}`)
+  }
+}
+
+async function onStripAll() {
+  if (!filePath.value) return
+  const confirmed = await ask(
+    'Remove every Curio annotation marker, comment, and suggested edit from this file? Edits will revert to their original (rejected) form. This cannot be undone via Curio.',
+    { title: 'Strip all Curio markers?', kind: 'warning' }
+  )
+  if (!confirmed) return
+
+  try {
+    // mode='original' keeps original text for edits (so they revert, not apply)
+    const stripped = stripAnnotations(rawContent.value, 'original')
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: stripped })
+    rawContent.value = stripped
+    setContent(stripped)
+    refreshAnnotations(stripped)
+    await persistSidecar()
+    showStatusNotification('All Curio markers removed.')
+  } catch (e) {
+    console.error('[Annotate] strip all failed:', e)
+    showStatusNotification(`Could not strip: ${e.message || e}`)
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Checkbox writes
+// ────────────────────────────────────────────────────────────────────────────
+
+async function onContentClick(e) {
+  const target = e.target
+  if (!(target instanceof HTMLInputElement)) return
+  if (target.type !== 'checkbox') return
+  if (!target.classList.contains('task-checkbox')) return
+
+  const idx = Number(target.dataset.taskIndex)
+  if (Number.isNaN(idx)) return
+
+  // Find the Nth task list item in rawContent and toggle it
+  const lines = rawContent.value.split('\n')
+  // Regex captures the checkbox state in source order. Skip lines inside code fences.
+  let inFence = false
+  let count = 0
+  let lineIndex = -1
+  let currentChecked = false
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (/^\s*```/.test(line)) { inFence = !inFence; continue }
+    if (inFence) continue
+    const m = line.match(/^(\s*[-*+]\s+)\[( |x|X)\](\s+)(.*)$/)
+    if (m) {
+      if (count === idx) {
+        lineIndex = i
+        currentChecked = m[2].toLowerCase() === 'x'
+        break
+      }
+      count++
+    }
+  }
+
+  if (lineIndex === -1) return
+
+  // Toggle the line
+  const newState = currentChecked ? ' ' : 'x'
+  const newLine = lines[lineIndex].replace(/^(\s*[-*+]\s+)\[( |x|X)\]/, `$1[${newState}]`)
+  const newLines = [...lines]
+  newLines[lineIndex] = newLine
+  const newContent = newLines.join('\n')
+
+  // Optimistically set the checkbox visually
+  target.checked = !currentChecked
+
+  try {
+    markSelfWrite()
+    await invoke('write_md_atomic', { path: filePath.value, content: newContent })
+    rawContent.value = newContent
+    setContent(newContent)
+  } catch (err) {
+    // Revert visual state on error
+    target.checked = currentChecked
+    console.error('[Annotate] checkbox write failed:', err)
+    showStatusNotification(`Could not save checkbox: ${err.message || err}`)
+  }
+}
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
@@ -334,6 +911,7 @@ onUnmounted(() => {
     <!-- Search bar -->
     <SearchBar
       v-model="searchQuery"
+      v-model:scope="searchScope"
       :is-open="isSearchOpen"
       :match-display="matchDisplay"
       @close="closeSearch"
@@ -360,38 +938,137 @@ onUnmounted(() => {
       <div class="status-dot"></div>
     </div>
 
-    <!-- Main content area -->
-    <main class="content">
-      <!-- Empty state -->
-      <div v-if="!hasContent && !isLoading && !error" class="empty-state">
-        <div class="empty-icon">📄</div>
-        <h2>Welcome to Curio</h2>
-        <p>Open a markdown file to get started</p>
-        <button @click="openFile" class="open-button">
-          Open File
-        </button>
-        <p class="shortcut-hint">or press <kbd>⌘</kbd> + <kbd>O</kbd></p>
+    <!-- View-mode + panel toggle toolbar (top-right) -->
+    <div
+      v-if="hasContent"
+      class="curio-view-toolbar"
+      :class="{ 'panel-open': panelOpen }"
+    >
+      <div class="view-mode-toggle" role="group" aria-label="View mode">
+        <button
+          :class="{ active: viewMode === 'annotated' }"
+          @click="viewMode = 'annotated'"
+          title="Show annotations and comments"
+        >Annotated</button>
+        <button
+          :class="{ active: viewMode === 'original' }"
+          @click="viewMode = 'original'"
+          title="Show the document as if no annotations existed"
+        >Original</button>
+        <button
+          :class="{ active: viewMode === 'final' }"
+          @click="viewMode = 'final'"
+          title="Preview the document with all suggested edits applied"
+        >Final</button>
       </div>
+      <button
+        class="panel-toggle"
+        :class="{ active: panelOpen }"
+        @click="panelOpen = !panelOpen"
+        title="Toggle annotations panel (⌘⇧A)"
+      >
+        💬 {{ annotations.length + orphans.length }}
+      </button>
+      <ViewMenu
+        @export-final="onExportFinal"
+        @strip-all="onStripAll"
+      />
+    </div>
 
-      <!-- Loading state -->
-      <div v-else-if="isLoading" class="loading-state">
-        <p>Loading...</p>
-      </div>
+    <!-- Layout: content + optional side panel -->
+    <div class="layout">
+      <!-- Main content area -->
+      <main class="content">
+        <!-- Empty state -->
+        <div v-if="!hasContent && !isLoading && !error" class="empty-state">
+          <div class="empty-icon">📄</div>
+          <h2>Welcome to Curio</h2>
+          <p>Open a markdown file to get started</p>
+          <button @click="openFile" class="open-button">
+            Open File
+          </button>
+          <p class="shortcut-hint">or press <kbd>⌘</kbd> + <kbd>O</kbd></p>
+        </div>
 
-      <!-- Error state -->
-      <div v-else-if="error" class="error-state">
-        <p>{{ error }}</p>
-        <button @click="openFile" class="open-button">Try Again</button>
-      </div>
+        <!-- Loading state -->
+        <div v-else-if="isLoading" class="loading-state">
+          <p>Loading...</p>
+        </div>
 
-      <!-- Rendered markdown content -->
-      <article
-        v-else
-        ref="contentRef"
-        class="markdown-body"
-        v-html="renderedHtml"
-      ></article>
-    </main>
+        <!-- Error state -->
+        <div v-else-if="error" class="error-state">
+          <p>{{ error }}</p>
+          <button @click="openFile" class="open-button">Try Again</button>
+        </div>
+
+        <!-- Rendered markdown content -->
+        <article
+          v-else
+          ref="contentRef"
+          class="markdown-body"
+          v-html="renderedHtml"
+          @click="onContentClick"
+        ></article>
+      </main>
+
+      <!-- Annotation panel -->
+      <AnnotationPanel
+        v-if="hasContent && panelOpen"
+        :open="panelOpen"
+        :annotations="annotations"
+        :orphans="orphans"
+        :orphan-suggestions="orphanSuggestions"
+        :reanchoring-id="reanchoringId"
+        @close="panelOpen = false"
+        @jump-to="onJumpTo"
+        @delete="onDeleteAnnotation"
+        @dismiss-orphan="onDismissOrphan"
+        @accept-suggestion="onAcceptSuggestion"
+        @start-reanchor="onStartReanchor"
+        @cancel-reanchor="onCancelReanchor"
+        @accept-edit="onAcceptEdit"
+        @reject-edit="onRejectEdit"
+        @accept-all-edits="onAcceptAllEdits"
+        @reject-all-edits="onRejectAllEdits"
+      />
+    </div>
+
+    <!-- Floating selection toolbar -->
+    <SelectionToolbar
+      v-if="hasContent && viewMode === 'annotated'"
+      ref="selectionToolbarRef"
+      :target="contentRef"
+      @comment="onSelectionComment"
+      @suggest="onSelectionSuggest"
+    />
+
+    <!-- Comment input popover -->
+    <CommentInput
+      :open="commentInputOpen"
+      :anchor-x="commentInputAnchorX"
+      :anchor-y="commentInputAnchorY"
+      :selection-text="pendingIntent === 'code-comment' ? (pendingCodeBlock?.text || '') : (pendingSelection?.text || '')"
+      @submit="onCommentSubmit"
+      @cancel="onCommentCancel"
+    />
+
+    <!-- Suggest edit input popover -->
+    <SuggestEditInput
+      :open="suggestInputOpen"
+      :anchor-x="suggestInputAnchorX"
+      :anchor-y="suggestInputAnchorY"
+      :original-text="pendingSelection?.text || ''"
+      @submit="onSuggestSubmit"
+      @cancel="onSuggestCancel"
+    />
+
+    <!-- Author identity prompt -->
+    <AuthorPrompt
+      :open="authorPromptOpen"
+      :initial="author"
+      @submit="onAuthorSubmit"
+      @cancel="onAuthorCancel"
+    />
   </div>
 </template>
 
@@ -407,11 +1084,145 @@ onUnmounted(() => {
   background: var(--bg-primary);
 }
 
+.layout {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
 /* Main content */
 .content {
   flex: 1;
   overflow-y: auto;
   padding: var(--content-padding);
+}
+
+/* View-mode + panel toggle toolbar */
+.curio-view-toolbar {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  z-index: 100;
+  transition: right 0.15s ease;
+}
+
+/* Annotation panel is 320px wide — shift the toolbar left of it when open
+   so it sits over the content area instead of the panel header. */
+.curio-view-toolbar.panel-open {
+  right: calc(320px + 16px);
+}
+
+.view-mode-toggle {
+  display: flex;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.view-mode-toggle button {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.view-mode-toggle button.active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.panel-toggle {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.panel-toggle.active {
+  color: var(--text-primary);
+}
+
+/* Curio annotation anchors */
+.markdown-body :deep(.curio-anchor),
+.curio-anchor {
+  background: rgba(0, 122, 255, 0.08);
+  border-bottom: 2px solid var(--accent, #007aff);
+  border-radius: 2px;
+  padding: 0 2px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.markdown-body :deep(.curio-anchor:hover),
+.curio-anchor:hover {
+  background: rgba(0, 122, 255, 0.18);
+}
+
+.markdown-body :deep(.curio-anchor-flash),
+.curio-anchor-flash {
+  animation: curio-flash 1.2s ease-out;
+}
+
+@keyframes curio-flash {
+  0% { background: rgba(255, 213, 0, 0.55); }
+  100% { background: rgba(0, 122, 255, 0.08); }
+}
+
+@media (prefers-color-scheme: dark) {
+  .markdown-body :deep(.curio-anchor),
+  .curio-anchor {
+    background: rgba(10, 132, 255, 0.15);
+  }
+  .markdown-body :deep(.curio-anchor:hover),
+  .curio-anchor:hover {
+    background: rgba(10, 132, 255, 0.28);
+  }
+}
+
+/* Curio suggested-edit anchors — orange to distinguish from comments */
+.markdown-body :deep(.curio-edit),
+.curio-edit {
+  background: rgba(255, 149, 0, 0.10);
+  border-bottom: 2px solid rgb(255, 149, 0);
+  border-radius: 2px;
+  padding: 0 2px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.markdown-body :deep(.curio-edit:hover),
+.curio-edit:hover {
+  background: rgba(255, 149, 0, 0.22);
+}
+
+.markdown-body :deep(.curio-anchor-flash),
+.curio-anchor-flash {
+  animation: curio-flash 1.2s ease-out;
+}
+
+@media (prefers-color-scheme: dark) {
+  .markdown-body :deep(.curio-edit),
+  .curio-edit {
+    background: rgba(255, 159, 10, 0.15);
+  }
+  .markdown-body :deep(.curio-edit:hover),
+  .curio-edit:hover {
+    background: rgba(255, 159, 10, 0.30);
+  }
 }
 
 /* Empty state */
@@ -703,6 +1514,23 @@ kbd {
   background: rgba(0, 0, 0, 0.3);
   border-color: rgba(255, 255, 255, 0.1);
   color: rgba(255, 255, 255, 0.7);
+}
+
+.curio-code-comment-btn {
+  top: 8px;
+  right: 48px;
+  background: rgba(0, 0, 0, 0.3);
+  border-color: rgba(255, 255, 255, 0.1);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.code-block-wrapper:hover > .curio-code-comment-btn {
+  opacity: 1;
+}
+
+.curio-code-comment-btn:hover {
+  background: rgba(0, 0, 0, 0.5);
 }
 
 .copy-code-btn:hover {

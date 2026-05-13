@@ -1,12 +1,12 @@
 # Curio Test Document
 
-Welcome to **Curio**, a beautiful markdown viewer for macOS. This document tests all the rendering features.
+Welcome to **Curio**, a fantastic markdown viewer for macOS. This document tests all the rendering features.
 
 ## Text Formatting
 
 This is a paragraph with **bold text**, *italic text*, and ~~strikethrough text~~. You can also combine them: ***bold and italic***.
 
-Here's some `inline code` within a sentence.
+Here’s some inline code within a sentence.
 
 ## Links
 
@@ -18,7 +18,7 @@ Here's some `inline code` within a sentence.
 
 - [x] Complete Phase 1A - Foundation
 - [x] Complete Phase 1B - Markdown Rendering
-- [x] Complete Phase 1C - Enhanced Rendering
+- [ ] Complete Phase 1C - Enhanced Rendering
 - [ ] Phase 1D - Search & Polish
 
 ## Code Blocks with Syntax Highlighting
@@ -223,5 +223,11 @@ gantt
 > — Alan Kay
 
 ---
+
+## Some test text
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed elementum bibendum lorem non sodales. Nam sit amet metus eget ante molestie fringilla. Fusce lacinia varius dui quis malesuada. Quisque consequat leo id orci tristique pellentesque. Integer aliquam dignissim convallis. Pellentesque non dapibus enim, quis consectetur mi. Mauris tincidunt ipsum ut est scelerisque, sed accumsan justo imperdiet. Proin elementum, neque eu interdum feugiat, risus augue finibus eros, aliquet porttitor nulla lacus in justo. Morbi gravida id est quis malesuada. Pellentesque ut orci vel augue dapibus aliquam nec commodo tortor. Nullam urna urna, cursus non ipsum vel, laoreet scelerisque odio. Nulla at ex congue, sagittis diam vitae, porttitor nulla. Donec eget dolor tortor. Mauris dapibus ligula eget neque luctus tincidunt. Morbi a cursus sem. Aenean ac tellus id sem tincidunt accumsan eu eu tortor.
+
+Aliquam dictum laoreet ante. Nullam viverra lectus in libero vulputate, et lacinia nunc pretium. Morbi convallis augue non erat egestas, id porta justo imperdiet. Nulla at accumsan nisl. Praesent nisl erat, vulputate vel justo id, finibus dignissim mauris. Donec vehicula ante ut urna dignissim mollis. Proin mollis massa sed nisi laoreet, non varius orci tincidunt. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Etiam vel eros posuere lacus mattis ultricies in ac est.
 
 *If everything renders correctly, Phase 1C is complete!* 🎉
