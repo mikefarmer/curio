@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 
-const emit = defineEmits(['exportFinal', 'stripAll'])
+const emit = defineEmits(['exportFinal', 'stripAll', 'copyPath'])
 
 const open = ref(false)
 const menuRef = ref(null)
@@ -29,6 +29,11 @@ function onStrip() {
   emit('stripAll')
 }
 
+function onCopyPath() {
+  close()
+  emit('copyPath')
+}
+
 onMounted(() => document.addEventListener('mousedown', handleClickOutside))
 onUnmounted(() => document.removeEventListener('mousedown', handleClickOutside))
 </script>
@@ -40,6 +45,10 @@ onUnmounted(() => document.removeEventListener('mousedown', handleClickOutside))
       <button @click="onExport">
         <span class="label">Export Final…</span>
         <span class="hint">Strip annotations, apply edits</span>
+      </button>
+      <button @click="onCopyPath">
+        <span class="label">Copy File Path</span>
+        <span class="hint">Copy the full path to the clipboard</span>
       </button>
       <button @click="onStrip" class="destructive">
         <span class="label">Strip All Curio Markers…</span>

@@ -254,6 +254,10 @@ function processTaskLists(html) {
 function transformAnnotationMarkers(content) {
   return content
     .replace(
+      /\n*<!--curio:comment\s+id=[0-9a-f]{8}\b[^>]*-->[\s\S]*?<!--\/curio:comment-->/g,
+      ''
+    )
+    .replace(
       /<!--curio:c=([0-9a-f]{8})-->([\s\S]*?)<!--\/curio:c-->/g,
       (_, id, inner) => `<span class="curio-anchor" data-curio-id="${id}">${inner}</span>`
     )

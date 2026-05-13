@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 
 const props = defineProps({
   open: { type: Boolean, default: true },
@@ -8,8 +8,24 @@ const props = defineProps({
   // Map<orphanId, { idx, candidates, anchorText }> with fuzzy suggestions for each orphan
   orphanSuggestions: { type: Object, default: () => ({}) },
   // True while waiting for the user to select text for an orphan re-anchor
-  reanchoringId: { type: String, default: null }
+  reanchoringId: { type: String, default: null },
+  // Currently focused annotation id (set when user clicks a highlight in the doc)
+  activeId: { type: String, default: null }
 })
+
+// Refs keyed by annotation id so we can scroll the active card into view
+const cardRefs = ref({})
+function setCardRef(id, el) {
+  if (el) cardRefs.value[id] = el
+  else delete cardRefs.value[id]
+}
+
+watch(() => props.activeId, async (id) => {
+  if (!id) return
+  await nextTick()
+  const el = cardRefs.value[id]
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}, { immediate: true })
 
 const emit = defineEmits([
   'close', 'jumpTo', 'delete', 'dismissOrphan',
@@ -86,8 +102,9 @@ function previewBody(body) {
       <div
         v-for="ann in filteredAnnotations"
         :key="ann.id"
+        :ref="el => setCardRef(ann.id, el)"
         class="annotation"
-        :class="{ 'is-edit': ann.type === 'edit' }"
+        :class="{ 'is-edit': ann.type === 'edit', 'is-active': activeId === ann.id }"
         @click="emit('jumpTo', ann.id)"
       >
         <div class="meta">
@@ -297,6 +314,7 @@ header h3 {
 .annotation {
   background: var(--bg-primary);
   border: 1px solid var(--border);
+  border-left: 3px solid rgb(0, 122, 255);
   border-radius: 6px;
   padding: 10px;
   margin-bottom: 8px;
@@ -306,10 +324,27 @@ header h3 {
 
 .annotation:hover {
   border-color: var(--accent, #007aff);
+  border-left-color: rgb(0, 122, 255);
 }
 
 .annotation.is-edit {
   border-left: 3px solid rgb(255, 149, 0);
+}
+
+.annotation.is-edit:hover {
+  border-left-color: rgb(255, 149, 0);
+}
+
+.annotation.is-active {
+  border-color: rgb(0, 122, 255);
+  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.25);
+  background: rgba(0, 122, 255, 0.06);
+}
+
+.annotation.is-active.is-edit {
+  border-color: rgb(255, 149, 0);
+  box-shadow: 0 0 0 2px rgba(255, 149, 0, 0.25);
+  background: rgba(255, 149, 0, 0.06);
 }
 
 .edit-badge {

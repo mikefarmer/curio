@@ -1,12 +1,29 @@
+<!-- curio-sidecar: 7edaf17a-6904-40cb-8f88-e52960aab580 -->
+<!--
+This file uses Curio annotation markers (curio.app).
+- Commented ranges are wrapped between HTML-comment markers named "curio:c=ID" with the highlighted text between them; a blockquote containing the comment body follows.
+- Suggested edits are wrapped between HTML-comment markers named "curio:e=ID" around the form: ~~old~~ → **new**.
+- Suggested removals use _(removed)_ in place of **new**.
+- Please preserve these markers when rewriting this file.
+-->
+
 # Curio Test Document
 
 Welcome to **Curio**, a fantastic markdown viewer for macOS. This document tests all the rendering features.
 
 ## Text Formatting
 
-This is a paragraph with **bold text**, *italic text*, and ~~strikethrough text~~. You can also combine them: ***bold and italic***.
+This is a <!--curio:c=f45261c7-->paragraph<!--/curio:c--> with **bold text**, *italic text*, and ~~strikethrough text~~. You can also combine them: ***bold and italic***.
 
-Here’s some inline code within a sentence.
+<!--curio:comment id=f45261c7 author=Mike ts=2026-05-13T22:54:52.098Z-->
+> 💬 **Mike**: Footer
+<!--/curio:comment-->
+
+Here’s some inline code within a <!--curio:c=7f2915f9-->sentence<!--/curio:c-->.
+
+<!--curio:comment id=7f2915f9 author=Mike ts=2026-05-13T23:05:08.313Z-->
+> 💬 **Mike**: Foo
+<!--/curio:comment-->
 
 ## Links
 
@@ -204,7 +221,7 @@ gantt
     Search & Polish     :         p1d, after p1c, 4d
     section Phase 2
     Auto-reload         :         p2a, after p1d, 3d
-    TOC Sidebar         :         p2b, after p2a, 4d
+    TOC SidebaR         :         p2b, after p2a, 4d
 ```
 
 ## Tables
@@ -226,7 +243,15 @@ gantt
 
 ## Some test text
 
-Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed elementum bibendum lorem non sodales. Nam sit amet metus eget ante molestie fringilla. Fusce lacinia varius dui quis malesuada. Quisque consequat leo id orci tristique pellentesque. Integer aliquam dignissim convallis. Pellentesque non dapibus enim, quis consectetur mi. Mauris tincidunt ipsum ut est scelerisque, sed accumsan justo imperdiet. Proin elementum, neque eu interdum feugiat, risus augue finibus eros, aliquet porttitor nulla lacus in justo. Morbi gravida id est quis malesuada. Pellentesque ut orci vel augue dapibus aliquam nec commodo tortor. Nullam urna urna, cursus non ipsum vel, laoreet scelerisque odio. Nulla at ex congue, sagittis diam vitae, porttitor nulla. Donec eget dolor tortor. Mauris dapibus ligula eget neque luctus tincidunt. Morbi a cursus sem. Aenean ac tellus id sem tincidunt accumsan eu eu tortor.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed elementum bibendum lorem non sodales. Nam sit amet metus eget ante molestie fringilla. Fusce lacinia varius dui quis malesuada. Quisque consequat leo id orci tristique pellentesque. Integer aliquam dignissim convallis. Pellentesque non dapibus enim, quis consectetur mi. Mauris tincidunt ipsum ut est scelerisque, sed accumsan justo imperdiet. <!--curio:c=d8dc3ba2-->Proin elementum,<!--/curio:c--> neque eu interdum feugiat, risus augue finibus eros, aliquet porttitor nulla lacus in justo. Morbi gravida id est quis malesuada. Pellentesque ut orci vel augue dapibus aliquam nec commodo tortor. Nullam urna urna, cursus non ipsum vel, laoreet scelerisque odio. Nulla at ex congue, sagittis diam vitae, porttitor nulla. Donec eget dolor tortor. Mauris dapibus ligula eget neque <!--curio:c=39507f0c-->luctus tincidunt<!--/curio:c-->. Morbi a cursus sem. Aenean ac tellus id sem tincidunt accumsan eu eu tortor.
+
+<!--curio:comment id=39507f0c author=Mike ts=2026-05-13T23:12:33.664Z-->
+> 💬 **Mike**: Boo 2!
+<!--/curio:comment-->
+
+<!--curio:comment id=d8dc3ba2 author=Mike ts=2026-05-13T23:12:21.191Z-->
+> 💬 **Mike**: Boo!
+<!--/curio:comment-->
 
 Aliquam dictum laoreet ante. Nullam viverra lectus in libero vulputate, et lacinia nunc pretium. Morbi convallis augue non erat egestas, id porta justo imperdiet. Nulla at accumsan nisl. Praesent nisl erat, vulputate vel justo id, finibus dignissim mauris. Donec vehicula ante ut urna dignissim mollis. Proin mollis massa sed nisi laoreet, non varius orci tincidunt. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Etiam vel eros posuere lacus mattis ultricies in ac est.
 

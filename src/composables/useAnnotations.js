@@ -5,6 +5,7 @@ const FORMAT_VERSION = 1
 
 // Regex for the sidecar pointer line in the .md
 const SIDECAR_HEADER_RE = /<!--\s*curio-sidecar:\s*([0-9a-fA-F-]{36})\s*-->/
+const SIDECAR_HEADER_RE_G = /<!--\s*curio-sidecar:\s*([0-9a-fA-F-]{36})\s*-->/g
 
 // Regex for an inline comment range
 const COMMENT_RANGE_RE = /<!--curio:c=([0-9a-f]{8})-->([\s\S]*?)<!--\/curio:c-->/g
@@ -43,6 +44,7 @@ function extractNewText(neuRaw) {
 // format and any legacy block whose examples accidentally contained nested
 // `-->` sequences (which broke the outer comment).
 const LLM_DOC_RE = /<!--[\s\S]*?This file uses Curio annotation markers[\s\S]*?Please preserve these markers when rewriting this file\.[\s\S]*?-->/
+const LLM_DOC_RE_G = /<!--[\s\S]*?This file uses Curio annotation markers[\s\S]*?Please preserve these markers when rewriting this file\.[\s\S]*?-->/g
 
 function llmDocBlock() {
   return `<!--
@@ -112,52 +114,32 @@ async function sha256(text) {
  * (and the LLM doc block) after any YAML frontmatter (--- ... ---) or at the top.
  */
 function ensureSidecarHeader(content, preferredUuid = null) {
-  const match = content.match(SIDECAR_HEADER_RE)
-  if (match) {
-    // Header present — heal an out-of-date / broken LLM doc block in place.
-    const currentBlock = llmDocBlock()
-    const existing = content.match(LLM_DOC_RE)
-    if (existing && existing[0] !== currentBlock) {
-      return {
-        content: content.replace(LLM_DOC_RE, currentBlock),
-        uuid: match[1],
-        changed: true
-      }
-    }
-    // Header present, no LLM block found — inject one right after the header
-    if (!existing) {
-      const headerIdx = content.indexOf(match[0])
-      const insertAt = headerIdx + match[0].length
-      const after = content.slice(insertAt)
-      // Avoid duplicating leading newlines
-      const sep = after.startsWith('\n') ? '\n' : '\n\n'
-      return {
-        content: content.slice(0, insertAt) + sep + currentBlock + (after.startsWith('\n') ? '' : '\n') + after,
-        uuid: match[1],
-        changed: true
-      }
-    }
-    return { content, uuid: match[1], changed: false }
-  }
+  const original = content
+  const currentBlock = llmDocBlock()
 
-  // Reuse the sidecar's existing UUID when re-injecting a stripped header
-  // (e.g. after "Strip All"), so we don't fork the sidecar.
-  const uuid = preferredUuid || crypto.randomUUID()
-  const header = `<!-- curio-sidecar: ${uuid} -->\n${llmDocBlock()}\n\n`
+  // Collect every sidecar marker and llm doc block; keep the first of each.
+  const headers = [...content.matchAll(SIDECAR_HEADER_RE_G)]
+  const docs = [...content.matchAll(LLM_DOC_RE_G)]
+  const keptUuid = headers.length ? headers[0][1] : null
+  const keptHeader = headers.length ? headers[0][0] : null
+  const keptDoc = docs.length ? docs[0][0] : null
 
-  // Insert after frontmatter if present
+  // Strip every marker; we re-inject exactly one of each below.
+  content = content.replace(SIDECAR_HEADER_RE_G, '').replace(LLM_DOC_RE_G, '')
+  // Collapse any blank-line runs the stripping left behind.
+  content = content.replace(/\n{3,}/g, '\n\n')
+
+  const uuid = keptUuid || preferredUuid || crypto.randomUUID()
+  const header = `<!-- curio-sidecar: ${uuid} -->\n${currentBlock}\n\n`
+
+  let insertAt = 0
   if (content.startsWith('---\n')) {
     const fmEnd = content.indexOf('\n---\n', 4)
-    if (fmEnd !== -1) {
-      const insertAt = fmEnd + 5
-      return {
-        content: content.slice(0, insertAt) + header + content.slice(insertAt),
-        uuid,
-        changed: true
-      }
-    }
+    if (fmEnd !== -1) insertAt = fmEnd + 5
   }
-  return { content: header + content, uuid, changed: true }
+
+  const out = content.slice(0, insertAt) + header + content.slice(insertAt).replace(/^\n+/, '')
+  return { content: out, uuid, changed: out !== original }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

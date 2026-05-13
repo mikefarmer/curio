@@ -4,6 +4,8 @@ import { save } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
 import { open, ask } from '@tauri-apps/plugin-dialog'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { listen } from '@tauri-apps/api/event'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import mermaid from 'mermaid'
 import { useMarkdown } from './composables/useMarkdown'
 import { useSearch } from './composables/useSearch'
@@ -11,7 +13,6 @@ import { useFileWatcher } from './composables/useFileWatcher'
 import { useSectionCopy } from './composables/useSectionCopy'
 import { useAnnotations, stripAnnotations } from './composables/useAnnotations'
 import { useUndoStack } from './composables/useUndoStack'
-import SearchBar from './components/SearchBar.vue'
 import SelectionToolbar from './components/SelectionToolbar.vue'
 import CommentInput from './components/CommentInput.vue'
 import SuggestEditInput from './components/SuggestEditInput.vue'
@@ -44,7 +45,6 @@ const { renderedHtml, setContent, viewMode } = useMarkdown()
 // Search composable
 const {
   searchQuery,
-  searchScope,
   isSearchOpen,
   matchDisplay,
   contentElement,
@@ -98,7 +98,9 @@ const statusMessage = ref('')  // Notification message for user
 const showStatus = ref(false)  // Show status notification
 
 // Annotation UI state
-const panelOpen = ref(true)
+const panelOpen = ref(false)
+const activeAnnotationId = ref(null)  // Currently highlighted comment (sidebar focus)
+const topSearchInputRef = ref(null)   // Persistent find input in the top toolbar
 const selectionToolbarRef = ref(null)
 const commentInputOpen = ref(false)
 const commentInputAnchorX = ref(0)
@@ -118,7 +120,6 @@ const reanchoringId = ref(null)     // orphan id currently in re-anchor mode
 const editMode = ref('suggest')
 const directBuffer = ref('')       // textarea content while in direct mode
 const directTextareaRef = ref(null)
-let directWriteTimer = null         // debounce handle for direct-mode disk writes
 
 // Annotation-level undo stack (v4). Direct-mode char edits use the
 // textarea's native browser undo — see useUndoStack.js for rationale.
@@ -218,6 +219,17 @@ async function openFile() {
   }
 }
 
+// Run an in-place content mutation while preserving the scroll position of
+// the main content area. Use for annotation create/delete/accept/reject so
+// the view doesn't jump after a write.
+async function withPreservedScroll(fn) {
+  const scroller = document.querySelector('main.content')
+  const top = scroller ? scroller.scrollTop : 0
+  await fn()
+  await nextTick()
+  if (scroller) scroller.scrollTop = top
+}
+
 // Handle file changes from watcher
 async function handleFileChange(event) {
   // Event type is now a simple string from our coalesced watcher
@@ -304,6 +316,14 @@ async function loadFile(path) {
     try {
       const result = await loadAnnotationsForFile(content, path)
       content = result.contentOut
+      if (result.contentChanged) {
+        try {
+          markSelfWrite()
+          await invoke('write_md_atomic', { path, content })
+        } catch (e) {
+          console.error('[Annotate] header heal write failed:', e)
+        }
+      }
     } catch (e) {
       console.error('[Annotate] loadForFile failed:', e)
     }
@@ -378,10 +398,14 @@ function handleKeydown(e) {
     closeCurrentWindow()
   }
 
-  // Cmd+F - Search
+  // Cmd+F - Focus the persistent find input in the top toolbar
   if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
     e.preventDefault()
     openSearch()
+    nextTick(() => {
+      topSearchInputRef.value?.focus()
+      topSearchInputRef.value?.select()
+    })
   }
 
   // Cmd+R - Manual reload
@@ -408,10 +432,24 @@ function handleKeydown(e) {
     panelOpen.value = !panelOpen.value
   }
 
-  // Cmd+Shift+D - Toggle Direct edit mode
+  // Cmd+Shift+D - Enter Direct edit mode (Save/Cancel buttons exit it)
   if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'd' || e.key === 'D')) {
     e.preventDefault()
-    setEditMode(editMode.value === 'direct' ? 'suggest' : 'direct')
+    if (editMode.value !== 'direct') setEditMode('direct')
+  }
+
+  // Inside direct edit: Esc = cancel, ⌘S = save
+  if (editMode.value === 'direct') {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      cancelDirectEdit()
+      return
+    }
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === 's' || e.key === 'S')) {
+      e.preventDefault()
+      saveDirectEdit()
+      return
+    }
   }
 
   // Cmd+Z / Cmd+Shift+Z — annotation-level undo/redo. Only fires when
@@ -438,6 +476,20 @@ function handleKeydown(e) {
   }
 }
 
+// Keydown handler for the toolbar's find input. Enter / Shift+Enter cycle
+// matches; Esc clears the query and blurs.
+function onTopSearchKeydown(e) {
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    closeSearch()
+    e.target.blur()
+  } else if (e.key === 'Enter') {
+    e.preventDefault()
+    if (e.shiftKey) prevMatch()
+    else nextMatch()
+  }
+}
+
 // Check for file to load on startup
 async function checkStartupFile() {
   // First, check URL query parameter (for windows opened with a specific file)
@@ -450,29 +502,64 @@ async function checkStartupFile() {
     return
   }
 
-  // No file param - this is the main window, check for CLI arguments
+  // No file param — this is the main window. Collect both CLI args and any
+  // macOS file-association opens that arrived before the listener registered.
+  let startupFiles = []
   try {
     const cliFiles = await invoke('get_cli_files')
-
-    if (cliFiles.length > 0) {
-      // Load first file in this window
-      await loadFile(cliFiles[0])
-
-      // Open additional windows for remaining files
-      for (let i = 1; i < cliFiles.length; i++) {
-        await invoke('create_window', { filePath: cliFiles[i] })
-      }
-    }
+    startupFiles = startupFiles.concat(cliFiles)
   } catch (e) {
     console.error('Failed to get CLI files:', e)
   }
+  try {
+    const pending = await invoke('take_pending_opens')
+    startupFiles = startupFiles.concat(pending)
+  } catch (e) {
+    console.error('Failed to get pending opens:', e)
+  }
+
+  if (startupFiles.length > 0) {
+    await loadFile(startupFiles[0])
+    for (let i = 1; i < startupFiles.length; i++) {
+      await invoke('create_window', { filePath: startupFiles[i] })
+    }
+  }
 }
 
-onMounted(() => {
+// Receive macOS file-association opens that arrive while the app is running.
+// If this window is empty, claim the file ourselves so the welcome screen
+// doesn't linger; otherwise spawn a new window so the open document is
+// preserved. Without this guard every window would race to claim the file.
+let openFileUnlisten = null
+async function registerOpenFileListener() {
+  openFileUnlisten = await listen('open-file', async (event) => {
+    const path = event.payload
+    if (!path) return
+    // Dedup: if we just loaded this file (via the startup drain or a previous
+    // event), do nothing. Otherwise an event queued during mount would spawn
+    // a duplicate window.
+    if (filePath.value === path) return
+    if (!hasContent.value && !filePath.value) {
+      // Drain the buffer too so a later mount doesn't replay this file.
+      try { await invoke('take_pending_opens') } catch (e) { /* ignore */ }
+      await loadFile(path)
+    } else {
+      try { await invoke('create_window', { filePath: path }) }
+      catch (e) { console.error('Failed to open file in new window:', e) }
+    }
+  })
+}
+
+onMounted(async () => {
   window.addEventListener('keydown', handleKeydown)
   // Load saved author name; if none, we'll prompt on first comment.
   initAuthor()
-  checkStartupFile()
+  // Register the listener before draining pending opens so a file delivered
+  // between the two awaits can't slip through unnoticed (it will land in
+  // PendingOpens and the listener will also fire — both paths are idempotent
+  // because loadFile is guarded by hasContent above).
+  await registerOpenFileListener()
+  await checkStartupFile()
 })
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -628,9 +715,11 @@ async function onCommentSubmit(body) {
     pushUndo(rawContent.value, pendingIntent.value === 'code-comment' ? 'code comment' : 'comment')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
-    rawContent.value = newContent
-    setContent(newContent)
-    refreshAnnotations(newContent)
+    await withPreservedScroll(() => {
+      rawContent.value = newContent
+      setContent(newContent)
+      refreshAnnotations(newContent)
+    })
     await persistSidecar()
   } catch (e) {
     console.error('[Annotate] create comment failed:', e)
@@ -667,9 +756,11 @@ async function onSuggestSubmit(newText) {
     pushUndo(rawContent.value, 'suggest edit')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
-    rawContent.value = newContent
-    setContent(newContent)
-    refreshAnnotations(newContent)
+    await withPreservedScroll(() => {
+      rawContent.value = newContent
+      setContent(newContent)
+      refreshAnnotations(newContent)
+    })
     await persistSidecar()
   } catch (e) {
     console.error('[Annotate] create edit failed:', e)
@@ -692,9 +783,11 @@ async function applyContentChange(newContent, undoLabel = null) {
   if (undoLabel !== null) pushUndo(rawContent.value, undoLabel)
   markSelfWrite()
   await invoke('write_md_atomic', { path: filePath.value, content: newContent })
-  rawContent.value = newContent
-  setContent(newContent)
-  refreshAnnotations(newContent)
+  await withPreservedScroll(() => {
+    rawContent.value = newContent
+    setContent(newContent)
+    refreshAnnotations(newContent)
+  })
   await persistSidecar()
 }
 
@@ -747,9 +840,11 @@ async function onDeleteAnnotation(id) {
     pushUndo(rawContent.value, 'delete annotation')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
-    rawContent.value = newContent
-    setContent(newContent)
-    refreshAnnotations(newContent)
+    await withPreservedScroll(() => {
+      rawContent.value = newContent
+      setContent(newContent)
+      refreshAnnotations(newContent)
+    })
     await persistSidecar()
   } catch (e) {
     console.error('[Annotate] delete failed:', e)
@@ -757,6 +852,7 @@ async function onDeleteAnnotation(id) {
 }
 
 function onJumpTo(id) {
+  activeAnnotationId.value = id
   // First try inline-anchor types
   let el = document.querySelector(
     `.curio-anchor[data-curio-id="${id}"], .curio-edit[data-curio-id="${id}"]`
@@ -860,6 +956,17 @@ async function onExportFinal() {
   }
 }
 
+async function onCopyPath() {
+  if (!filePath.value) return
+  try {
+    await writeText(filePath.value)
+    showStatusNotification('File path copied to clipboard')
+  } catch (e) {
+    console.error('[Menu] copy path failed:', e)
+    showStatusNotification(`Could not copy path: ${e.message || e}`)
+  }
+}
+
 async function onStripAll() {
   if (!filePath.value) return
   const confirmed = await ask(
@@ -900,52 +1007,66 @@ function setEditMode(mode) {
     editMode.value = 'direct'
     nextTick(() => directTextareaRef.value?.focus())
   } else {
-    // Leaving direct mode: flush any pending write synchronously so the
-    // file and rawContent agree before the rendered view comes back.
-    flushDirectWrite({ immediate: true })
+    // Direct → suggest exits without writing. Callers wanting to persist
+    // the buffer must call saveDirectEdit() first; otherwise the in-progress
+    // edits are discarded (Cancel semantics).
     editMode.value = 'suggest'
+    directBuffer.value = ''
+    // The article remounts with the existing renderedHtml — fresh DOM nodes
+    // for `<pre class="mermaid">` haven't been processed yet. The renderedHtml
+    // watcher only fires on value changes, so trigger post-processing here.
+    nextTick(() => {
+      renderMermaidDiagrams()
+      injectCopyButtons(contentRef.value, rawContent.value)
+      injectCodeCommentButtons(contentRef.value)
+    })
   }
 }
 
 function onDirectInput(e) {
+  // Buffer-only: nothing is persisted until the user clicks Save.
   directBuffer.value = e.target.value
-  if (directWriteTimer) clearTimeout(directWriteTimer)
-  directWriteTimer = setTimeout(() => flushDirectWrite(), 500)
 }
 
-async function flushDirectWrite({ immediate = false } = {}) {
-  if (directWriteTimer) {
-    clearTimeout(directWriteTimer)
-    directWriteTimer = null
-  }
-  if (!filePath.value) return
-  if (directBuffer.value === rawContent.value) return
+/** Commit the direct-edit buffer to disk and return to suggest mode. */
+async function saveDirectEdit() {
+  if (!filePath.value) { setEditMode('suggest'); return }
+  if (directBuffer.value === rawContent.value) { setEditMode('suggest'); return }
 
   const newContent = directBuffer.value
   try {
+    pushUndo(rawContent.value, 'direct edit')
     markSelfWrite()
     await invoke('write_md_atomic', { path: filePath.value, content: newContent })
     rawContent.value = newContent
-    // Skip re-rendering HTML while user is actively typing — costly and
-    // they're not looking at it. Sync renderedHtml only on mode switch
-    // (immediate=true) so the suggest-mode view is fresh on return.
-    if (immediate) setContent(newContent)
+    setContent(newContent)
     refreshAnnotations(newContent)
     await persistSidecar()
+    setEditMode('suggest')
   } catch (e) {
     console.error('[Annotate] direct write failed:', e)
     showStatusNotification(`Could not save: ${e.message || e}`)
   }
 }
 
-// If the file changes externally while we're in direct mode, reload the
-// textarea buffer so the user sees the new content. Any unsaved <500ms
-// typing burst is lost — acceptable per the existing in-flight policy.
+/** Discard direct-edit buffer changes and return to suggest mode. */
+function cancelDirectEdit() {
+  setEditMode('suggest')
+}
+
+// If the file changes externally while we're in direct mode, refresh the
+// textarea — but only when the buffer has no unsaved edits (i.e. it still
+// matches the pre-change rawContent). Otherwise we'd clobber the user's work.
+let lastSyncedRaw = ''
 watch(rawContent, (newVal) => {
-  if (editMode.value === 'direct' && newVal !== directBuffer.value) {
-    // Avoid clobbering an in-flight debounced write by checking pending state
-    if (!directWriteTimer) directBuffer.value = newVal
+  if (editMode.value === 'direct') {
+    if (directBuffer.value === lastSyncedRaw) {
+      directBuffer.value = newVal
+    } else {
+      showStatusNotification('File changed on disk — your unsaved edits are preserved.')
+    }
   }
+  lastSyncedRaw = newVal
 })
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -993,6 +1114,20 @@ async function applyUndoSnapshot(content, label) {
 
 async function onContentClick(e) {
   const target = e.target
+
+  // Click on a commented highlight → open panel and activate that comment
+  if (target instanceof Element) {
+    const anchor = target.closest('.curio-anchor[data-curio-id]')
+    if (anchor) {
+      const id = anchor.getAttribute('data-curio-id')
+      if (id) {
+        activeAnnotationId.value = id
+        if (!panelOpen.value) panelOpen.value = true
+        return
+      }
+    }
+  }
+
   if (!(target instanceof HTMLInputElement)) return
   if (target.type !== 'checkbox') return
   if (!target.classList.contains('task-checkbox')) return
@@ -1050,93 +1185,96 @@ async function onContentClick(e) {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
+  if (openFileUnlisten) { openFileUnlisten(); openFileUnlisten = null }
 })
 </script>
 
 <template>
   <div class="app">
-    <!-- Search bar -->
-    <SearchBar
-      v-model="searchQuery"
-      v-model:scope="searchScope"
-      :is-open="isSearchOpen"
-      :match-display="matchDisplay"
-      @close="closeSearch"
-      @next="nextMatch"
-      @prev="prevMatch"
-    />
-
     <!-- Status notification -->
     <div v-if="showStatus" class="status-notification">
       {{ statusMessage }}
     </div>
 
-    <!-- Watcher status indicator -->
-    <div
-      v-if="hasContent"
-      class="watcher-status"
-      :class="{
-        'status-watching': isWatching && !watcherError,
-        'status-error': watcherError
-      }"
-      :title="watcherError ? 'Auto-reload failed. Press ⌘R to reload manually.' : 'Auto-reload active'"
-      @click="watcherError ? reloadCurrentFile() : null"
-    >
-      <div class="status-dot"></div>
-    </div>
+    <!-- Unified top toolbar: persistent across all modes. In normal modes it
+         hosts find, view-mode, edit toggle, panel toggle, menu, and the
+         watcher indicator. In Edit mode it morphs to Cancel / Save. -->
+    <header v-if="hasContent" class="top-toolbar" :class="{ 'is-editing': editMode === 'direct' }">
+      <template v-if="editMode === 'direct'">
+        <span class="top-toolbar-title">Editing raw markdown</span>
+        <div class="top-toolbar-group">
+          <button class="tb-btn" @click="cancelDirectEdit" title="Discard changes (Esc)">
+            Cancel
+          </button>
+          <button class="tb-btn tb-primary" @click="saveDirectEdit" title="Save and return (⌘S)">
+            Save
+          </button>
+        </div>
+      </template>
 
-    <!-- View-mode + panel toggle toolbar (top-right) -->
-    <div
-      v-if="hasContent"
-      class="curio-view-toolbar"
-      :class="{ 'panel-open': panelOpen }"
-    >
-      <div class="view-mode-toggle" role="group" aria-label="View mode">
+      <template v-else>
+        <!-- Watcher status — leading indicator. Click to reload on error. -->
+        <div
+          class="watcher-status"
+          :class="{
+            'status-watching': isWatching && !watcherError,
+            'status-error': watcherError
+          }"
+          :title="watcherError ? 'Auto-reload failed. Press ⌘R to reload manually.' : 'Auto-reload active'"
+          @click="watcherError ? reloadCurrentFile() : null"
+        >
+          <div class="status-dot"></div>
+        </div>
+
+        <!-- Find -->
+        <div class="tb-search">
+          <svg class="tb-search-icon" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z"/>
+          </svg>
+          <input
+            ref="topSearchInputRef"
+            type="text"
+            class="tb-search-input"
+            placeholder="Find…"
+            :value="searchQuery"
+            @input="searchQuery = $event.target.value"
+            @keydown="onTopSearchKeydown"
+          />
+          <span v-if="searchQuery && matchDisplay" class="tb-search-count">{{ matchDisplay }}</span>
+          <button v-if="searchQuery" class="tb-search-btn" @click="prevMatch" title="Previous (Shift+Enter)">▲</button>
+          <button v-if="searchQuery" class="tb-search-btn" @click="nextMatch" title="Next (Enter)">▼</button>
+          <button v-if="searchQuery" class="tb-search-btn" @click="closeSearch" title="Clear (Esc)">✕</button>
+        </div>
+
+        <!-- View mode -->
+        <div class="view-mode-toggle" role="group" aria-label="View mode">
+          <button :class="{ active: viewMode === 'annotated' }" @click="viewMode = 'annotated'" title="Show annotations and comments">Annotated</button>
+          <button :class="{ active: viewMode === 'original' }" @click="viewMode = 'original'" title="Show the document as if no annotations existed">Original</button>
+          <button :class="{ active: viewMode === 'final' }" @click="viewMode = 'final'" title="Preview the document with all suggested edits applied">Final</button>
+        </div>
+
+        <!-- Suggest / Edit toggle -->
+        <div class="edit-mode-toggle" role="group" aria-label="Edit mode">
+          <button :class="{ active: editMode === 'suggest' }" @click="setEditMode('suggest')" title="Selections create annotations (default)">Suggest</button>
+          <button :class="{ active: editMode === 'direct' }" @click="setEditMode('direct')" title="Edit the raw markdown directly (⌘⇧D)">Edit</button>
+        </div>
+
         <button
-          :class="{ active: viewMode === 'annotated' }"
-          @click="viewMode = 'annotated'"
-          :disabled="editMode === 'direct'"
-          title="Show annotations and comments"
-        >Annotated</button>
-        <button
-          :class="{ active: viewMode === 'original' }"
-          @click="viewMode = 'original'"
-          :disabled="editMode === 'direct'"
-          title="Show the document as if no annotations existed"
-        >Original</button>
-        <button
-          :class="{ active: viewMode === 'final' }"
-          @click="viewMode = 'final'"
-          :disabled="editMode === 'direct'"
-          title="Preview the document with all suggested edits applied"
-        >Final</button>
-      </div>
-      <!-- Edit-mode toggle (spec §12.4): Suggest vs Direct -->
-      <div class="edit-mode-toggle" role="group" aria-label="Edit mode">
-        <button
-          :class="{ active: editMode === 'suggest' }"
-          @click="setEditMode('suggest')"
-          title="Selections create annotations (default)"
-        >Suggest</button>
-        <button
-          :class="{ active: editMode === 'direct' }"
-          @click="setEditMode('direct')"
-          title="Edit the raw markdown directly (⌘⇧D)"
-        >Direct</button>
-      </div>
-      <button
-        class="panel-toggle"
-        :class="{ active: panelOpen }"
-        @click="panelOpen = !panelOpen"
-        title="Toggle annotations panel (⌘⇧A)"
-      >
-        💬 {{ annotations.length + orphans.length }}
-      </button>
-      <ViewMenu
-        @export-final="onExportFinal"
-        @strip-all="onStripAll"
-      />
-    </div>
+          class="panel-toggle"
+          :class="{ active: panelOpen }"
+          @click="panelOpen = !panelOpen"
+          title="Toggle annotations panel (⌘⇧A)"
+        >
+          💬 {{ annotations.length + orphans.length }}
+        </button>
+
+        <ViewMenu
+          @export-final="onExportFinal"
+          @strip-all="onStripAll"
+          @copy-path="onCopyPath"
+        />
+      </template>
+    </header>
 
     <!-- Layout: content + optional side panel -->
     <div class="layout">
@@ -1187,12 +1325,13 @@ onUnmounted(() => {
 
       <!-- Annotation panel -->
       <AnnotationPanel
-        v-if="hasContent && panelOpen"
+        v-if="hasContent && panelOpen && editMode !== 'direct'"
         :open="panelOpen"
         :annotations="annotations"
         :orphans="orphans"
         :orphan-suggestions="orphanSuggestions"
         :reanchoring-id="reanchoringId"
+        :active-id="activeAnnotationId"
         @close="panelOpen = false"
         @jump-to="onJumpTo"
         @delete="onDeleteAnnotation"
@@ -1272,21 +1411,122 @@ onUnmounted(() => {
 }
 
 /* View-mode + panel toggle toolbar */
-.curio-view-toolbar {
-  position: fixed;
-  top: 12px;
-  right: 16px;
+/* Unified top toolbar — persistent across all modes. Holds find, view-mode,
+   edit toggle, panel toggle, menu, and watcher status. In Edit mode the
+   content swaps to a Cancel/Save bar. */
+.top-toolbar {
+  flex-shrink: 0;
   display: flex;
-  gap: 8px;
   align-items: center;
-  z-index: 100;
-  transition: right 0.15s ease;
+  gap: 10px;
+  padding: 8px 14px 8px 84px; /* left padding clears macOS traffic lights */
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
 }
 
-/* Annotation panel is 320px wide — shift the toolbar left of it when open
-   so it sits over the content area instead of the panel header. */
-.curio-view-toolbar.panel-open {
-  right: calc(320px + 16px);
+.top-toolbar > * {
+  -webkit-app-region: no-drag;
+}
+
+.top-toolbar.is-editing {
+  justify-content: space-between;
+}
+
+.top-toolbar-title {
+  font-size: 12px;
+  color: var(--text-secondary);
+  -webkit-app-region: drag;
+}
+
+.top-toolbar-group {
+  display: flex;
+  gap: 8px;
+}
+
+.tb-btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.tb-btn:hover {
+  background: var(--border);
+}
+
+.tb-btn.tb-primary {
+  background: var(--accent, #007aff);
+  border-color: var(--accent, #007aff);
+  color: white;
+}
+
+.tb-btn.tb-primary:hover {
+  opacity: 0.9;
+  background: var(--accent, #007aff);
+}
+
+/* Find input inside the toolbar */
+.tb-search {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  max-width: 360px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 6px 0 8px;
+  height: 28px;
+}
+
+.tb-search-icon {
+  width: 13px;
+  height: 13px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.tb-search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding: 4px 6px;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  outline: none;
+  font-family: var(--font-text);
+}
+
+.tb-search-input::placeholder {
+  color: var(--text-secondary);
+}
+
+.tb-search-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  padding: 0 4px;
+}
+
+.tb-search-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 11px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.tb-search-btn:hover {
+  background: var(--border);
+  color: var(--text-primary);
 }
 
 .view-mode-toggle {
@@ -1390,45 +1630,39 @@ onUnmounted(() => {
   color: var(--text-primary);
 }
 
-/* Curio annotation anchors */
-.markdown-body :deep(.curio-anchor),
 .curio-anchor {
-  background: rgba(0, 122, 255, 0.08);
-  border-bottom: 2px solid var(--accent, #007aff);
+  background: rgba(0, 122, 255, 0.14);
+  border-bottom: 2px solid rgb(0, 122, 255);
   border-radius: 2px;
   padding: 0 2px;
   cursor: pointer;
   transition: background 0.15s;
 }
 
-.markdown-body :deep(.curio-anchor:hover),
 .curio-anchor:hover {
-  background: rgba(0, 122, 255, 0.18);
+  background: rgba(0, 122, 255, 0.28);
 }
 
-.markdown-body :deep(.curio-anchor-flash),
 .curio-anchor-flash {
   animation: curio-flash 1.2s ease-out;
 }
 
 @keyframes curio-flash {
-  0% { background: rgba(255, 213, 0, 0.55); }
-  100% { background: rgba(0, 122, 255, 0.08); }
+  0% { background: rgba(0, 122, 255, 0.55); }
+  100% { background: rgba(0, 122, 255, 0.14); }
 }
 
 @media (prefers-color-scheme: dark) {
-  .markdown-body :deep(.curio-anchor),
   .curio-anchor {
-    background: rgba(10, 132, 255, 0.15);
+    background: rgba(10, 132, 255, 0.22);
+    border-bottom-color: rgb(10, 132, 255);
   }
-  .markdown-body :deep(.curio-anchor:hover),
   .curio-anchor:hover {
-    background: rgba(10, 132, 255, 0.28);
+    background: rgba(10, 132, 255, 0.40);
   }
 }
 
 /* Curio suggested-edit anchors — orange to distinguish from comments */
-.markdown-body :deep(.curio-edit),
 .curio-edit {
   background: rgba(255, 149, 0, 0.10);
   border-bottom: 2px solid rgb(255, 149, 0);
@@ -1438,22 +1672,14 @@ onUnmounted(() => {
   transition: background 0.15s;
 }
 
-.markdown-body :deep(.curio-edit:hover),
 .curio-edit:hover {
   background: rgba(255, 149, 0, 0.22);
 }
 
-.markdown-body :deep(.curio-anchor-flash),
-.curio-anchor-flash {
-  animation: curio-flash 1.2s ease-out;
-}
-
 @media (prefers-color-scheme: dark) {
-  .markdown-body :deep(.curio-edit),
   .curio-edit {
     background: rgba(255, 159, 10, 0.15);
   }
-  .markdown-body :deep(.curio-edit:hover),
   .curio-edit:hover {
     background: rgba(255, 159, 10, 0.30);
   }
@@ -1601,26 +1827,15 @@ kbd {
   }
 }
 
-/* Watcher status indicator */
+/* Watcher status indicator — sits inline at the end of the top toolbar */
 .watcher-status {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  width: 32px;
-  height: 32px;
+  width: 18px;
+  height: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 50%;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  z-index: 999;
+  flex-shrink: 0;
   transition: all 0.2s ease;
-}
-
-.watcher-status:hover {
-  transform: scale(1.1);
 }
 
 .watcher-status.status-error {

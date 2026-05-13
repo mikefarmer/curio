@@ -6,7 +6,7 @@ use annotations::{
     read_sidecar, write_sidecar, delete_sidecar, list_sidecars,
     write_md_atomic, write_file_new, read_curio_config, write_curio_config,
 };
-use tauri::{RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::path::PathBuf;
@@ -17,12 +17,26 @@ static WINDOW_COUNTER: AtomicUsize = AtomicUsize::new(1);
 // Store for CLI file arguments
 struct CliFiles(Mutex<Vec<String>>);
 
+// Buffer for files delivered via macOS file association (RunEvent::Opened).
+// Drained by the frontend on mount via `take_pending_opens` to handle the
+// race where Opened fires before the first window has registered its listener.
+struct PendingOpens(Mutex<Vec<String>>);
+
 /// Get files passed via CLI arguments (called once on startup)
 #[tauri::command]
 fn get_cli_files(state: tauri::State<CliFiles>) -> Vec<String> {
     let mut files = state.0.lock().unwrap();
     let result = files.clone();
     files.clear(); // Clear after reading so they're only opened once
+    result
+}
+
+/// Drain any file-association opens that arrived before the frontend mounted.
+#[tauri::command]
+fn take_pending_opens(state: tauri::State<PendingOpens>) -> Vec<String> {
+    let mut files = state.0.lock().unwrap();
+    let result = files.clone();
+    files.clear();
     result
 }
 
@@ -120,11 +134,13 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(CliFiles(Mutex::new(cli_files)))
+        .manage(PendingOpens(Mutex::new(Vec::new())))
         .invoke_handler(tauri::generate_handler![
             read_file,
             get_filename,
             create_window,
             get_cli_files,
+            take_pending_opens,
             write_log,
             read_sidecar,
             write_sidecar,
@@ -140,32 +156,31 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let RunEvent::Opened { urls } = event {
-            // Handle files opened via macOS file association
+            // Files opened via macOS file association. We do NOT spawn a window
+            // here — the default window already exists (or another window is
+            // visible). Instead we hand the path to the frontend, which decides
+            // whether to load it in the current empty window or spawn a new one.
+            //
+            // Buffer in PendingOpens to cover the cold-launch race where this
+            // event fires before any frontend has registered an `open-file`
+            // listener. The frontend drains the buffer in onMounted.
             for url in urls {
                 if let Ok(path) = url.to_file_path() {
                     if let Some(path_str) = path.to_str() {
                         let file_path = path_str.to_string();
-                        let handle = app_handle.clone();
 
-                        // Create a new window for this file
-                        tauri::async_runtime::spawn(async move {
-                            let window_id = WINDOW_COUNTER.fetch_add(1, Ordering::SeqCst);
-                            let label = format!("curio-{}", window_id);
-                            let encoded = urlencoding::encode(&file_path);
-                            let url = WebviewUrl::App(format!("index.html?file={}", encoded).into());
-
-                            let title = PathBuf::from(&file_path)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("Curio")
-                                .to_string();
-
-                            let _ = WebviewWindowBuilder::new(&handle, &label, url)
-                                .title(&title)
-                                .inner_size(900.0, 700.0)
-                                .min_inner_size(400.0, 300.0)
-                                .build();
-                        });
+                        if let Some(state) = app_handle.try_state::<PendingOpens>() {
+                            state.0.lock().unwrap().push(file_path.clone());
+                        }
+                        // Emit to exactly one window — preferring "main", else
+                        // any existing window — so multi-window setups don't
+                        // race to handle the same open.
+                        let windows = app_handle.webview_windows();
+                        let target = windows.get("main").cloned()
+                            .or_else(|| windows.values().next().cloned());
+                        if let Some(win) = target {
+                            let _ = win.emit("open-file", file_path);
+                        }
                     }
                 }
             }
