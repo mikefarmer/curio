@@ -32,6 +32,33 @@ export function useFileWatcher() {
 
   const COALESCE_MS = 100
   const POLL_MS = 5000
+  const SELF_WRITE_SUPPRESS_MS = 500
+
+  // Timestamp until which incoming fs events are treated as self-writes
+  // and not delivered to the user callback.
+  let selfWriteUntil = 0
+
+  function inSelfWriteWindow() {
+    return Date.now() < selfWriteUntil
+  }
+
+  // Call right before (or right after) Curio writes the watched file
+  // to suppress the resulting watcher event.
+  function markSelfWrite() {
+    selfWriteUntil = Date.now() + SELF_WRITE_SUPPRESS_MS
+    log(`[Annotate] self-write marked, suppress until +${SELF_WRITE_SUPPRESS_MS}ms`)
+    // After the window expires, refresh mtime so the polling fallback
+    // doesn't subsequently false-fire on the new mtime.
+    setTimeout(async () => {
+      if (!currentFilePath) return
+      try {
+        const info = await stat(currentFilePath)
+        fileIdentity.mtime = info.mtime?.getTime() ?? null
+      } catch {
+        // ignore
+      }
+    }, SELF_WRITE_SUPPRESS_MS + 50)
+  }
 
   // Categorize raw fs event into a simple type
   function categorizeEvent(event) {
@@ -74,6 +101,18 @@ export function useFileWatcher() {
     const events = eventQueue.map(categorizeEvent)
     eventQueue = []
 
+    if (inSelfWriteWindow()) {
+      log(`[Annotate] self-write suppressed (${events.length} event(s))`)
+      // Still update mtime so polling doesn't false-fire later
+      if (currentFilePath) {
+        try {
+          const info = await stat(currentFilePath)
+          fileIdentity.mtime = info.mtime?.getTime() ?? null
+        } catch { /* ignore */ }
+      }
+      return
+    }
+
     const action = coalesceEvents(events)
     log(`Coalesced to action: ${action}`)
 
@@ -113,6 +152,11 @@ export function useFileWatcher() {
       const newMtime = info.mtime?.getTime() ?? null
 
       if (fileIdentity.mtime !== null && newMtime !== null && newMtime !== fileIdentity.mtime) {
+        if (inSelfWriteWindow()) {
+          log(`[Annotate] poll self-write suppressed (mtime ${fileIdentity.mtime} -> ${newMtime})`)
+          fileIdentity.mtime = newMtime
+          return
+        }
         log(`Poll detected change - mtime: ${fileIdentity.mtime} -> ${newMtime}`)
         fileIdentity.mtime = newMtime
         if (userCallback) {
@@ -238,6 +282,7 @@ export function useFileWatcher() {
     watcherError,
     startWatching,
     stopWatching,
-    getWatcherStatus
+    getWatcherStatus,
+    markSelfWrite
   }
 }

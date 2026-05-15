@@ -9,6 +9,9 @@ export function useSearch() {
   const currentMatchIndex = ref(0)
   const matches = ref([])
   const contentElement = ref(null)
+  // 'all' searches everywhere except code blocks; 'annotations' restricts to
+  // text inside curio comment blockquotes (and code-comment bodies).
+  const searchScope = ref('all')
 
   // Highlight class name
   const HIGHLIGHT_CLASS = 'search-highlight'
@@ -68,10 +71,15 @@ export function useSearch() {
     const textNodes = []
     let node
     while (node = walker.nextNode()) {
-      // Skip nodes inside pre/code blocks for better UX
       const parent = node.parentElement
+      // Skip code blocks (consistent UX across both scopes)
       if (parent && (parent.tagName === 'PRE' || parent.tagName === 'CODE' || parent.closest('pre'))) {
         continue
+      }
+      // In annotation-only scope, the text must live inside a blockquote
+      // (curio comment bodies always render that way).
+      if (searchScope.value === 'annotations') {
+        if (!parent || !parent.closest('blockquote')) continue
       }
       if (node.textContent.toLowerCase().includes(query)) {
         textNodes.push(node)
@@ -168,9 +176,9 @@ export function useSearch() {
     updateActiveMatch()
   }
 
-  // Watch for query changes and debounce search
+  // Watch for query/scope changes and debounce search
   let searchTimeout
-  watch(searchQuery, () => {
+  watch([searchQuery, searchScope], () => {
     clearTimeout(searchTimeout)
     searchTimeout = setTimeout(() => {
       performSearch()
@@ -187,6 +195,7 @@ export function useSearch() {
 
   return {
     searchQuery,
+    searchScope,
     isSearchOpen,
     currentMatchIndex,
     matchCount,

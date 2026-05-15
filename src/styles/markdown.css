@@ -180,7 +180,7 @@
 .markdown-body .task-checkbox {
   margin-right: 0.5em;
   vertical-align: middle;
-  pointer-events: none;
+  cursor: pointer;
 }
 
 /* Tables */

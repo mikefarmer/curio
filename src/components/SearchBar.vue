@@ -13,10 +13,18 @@ const props = defineProps({
   isOpen: {
     type: Boolean,
     default: false
+  },
+  scope: {
+    type: String,
+    default: 'all'  // 'all' | 'annotations'
   }
 })
 
-const emit = defineEmits(['update:modelValue', 'close', 'next', 'prev'])
+const emit = defineEmits(['update:modelValue', 'update:scope', 'close', 'next', 'prev'])
+
+function toggleScope() {
+  emit('update:scope', props.scope === 'annotations' ? 'all' : 'annotations')
+}
 
 const inputRef = ref(null)
 
@@ -57,11 +65,18 @@ function updateValue(e) {
         ref="inputRef"
         type="text"
         class="search-input"
-        placeholder="Search in document..."
+        :placeholder="scope === 'annotations' ? 'Search annotations…' : 'Search in document…'"
         :value="modelValue"
         @input="updateValue"
         @keydown="handleKeydown"
       />
+      <button
+        class="scope-toggle"
+        :class="{ active: scope === 'annotations' }"
+        @click="toggleScope"
+        title="Restrict search to annotations only"
+        type="button"
+      >💬</button>
       <span v-if="matchDisplay" class="match-count">{{ matchDisplay }}</span>
     </div>
     <div class="search-actions">
@@ -144,6 +159,28 @@ function updateValue(e) {
   color: var(--text-secondary);
   white-space: nowrap;
   padding-right: 4px;
+}
+
+.scope-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  opacity: 0.5;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.scope-toggle:hover {
+  opacity: 0.8;
+}
+
+.scope-toggle.active {
+  opacity: 1;
+  background: rgba(0, 122, 255, 0.15);
+  color: var(--accent, #007aff);
 }
 
 .search-actions {
